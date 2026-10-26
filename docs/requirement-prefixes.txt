@@ -1,0 +1,4 @@
+# Pinned requirement-prefix vocabulary, checked by review (EN-02.4).
+
+
+AR, PR, RR, BR, TR, NR, OR

@@ -1,0 +1,2 @@
+# Requirements no source file can cite (EN-02.7).
+AR-2: review of copy paths; no runtime counter establishes the copy design.

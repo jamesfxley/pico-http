@@ -1,0 +1,22 @@
+# Doxygen configuration for the pico-http API reference.
+#
+# Everything that does not vary lives in infra/house/config/Doxyfile.base; only the three
+# fields below differ between repositories. Doxygen applies assignments in
+# order, so these win over the include.
+#
+#   doxygen docs/Doxyfile      (output: docs/api/html/index.html, gitignored)
+
+@INCLUDE_PATH = infra/house/config
+@INCLUDE      = Doxyfile.base
+
+PROJECT_NAME  = pico-http
+PROJECT_BRIEF = "HTTP/1.1 server for the Raspberry Pi Pico 2 W"
+INPUT         = src/include \
+                src/config/include \
+                src/http/include \
+                src/tcp/include \
+                src/util/include \
+                src/testing/include \
+                src/tcp/lwip/include \
+                src/lwipopts/include \
+                src/lwipopts_reference/include

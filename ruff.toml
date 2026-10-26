@@ -1,0 +1,5 @@
+extend = "infra/house/config/ruff.toml"
+
+# Registered bench-harness deviations (EN-04.7); see docs/deviations.md.
+[lint.extend-per-file-ignores]
+"examples/bench/bench.py" = ["PLR0912", "C901", "PLR0915", "PLR0913", "PLR0917"]

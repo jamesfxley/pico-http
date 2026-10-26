@@ -1,0 +1,19 @@
+# Paths excluded from compile-db coverage, one git pathspec per line, `#` for a comment.
+#
+# For a directory some *other* build owns, whose sources are therefore absent
+# from this tree's compile database — linting them would run clang-tidy on
+# invented flags, the failure CXX-00.6 is about. Never for code this build
+# compiles, which must be linted. Not a suppression: everything named here is
+# still compiled under warnings-as-errors by the project that owns it.
+#
+# The compile-db coverage check reads this file. Lint enumerates compile
+# commands, so these sources are absent from its inputs. Every
+# tracked translation unit is either linted or declared absent here with a
+# written reason.
+
+# The installed-package consumer (consumer gate): a separate CMake
+# project configured against an installed pico_http under each sizing profile,
+# built by the `consumer` CI job. Neither the host nor the firmware tree
+# references it, so its translation unit is in neither half of the merged
+# compile database.
+tests/consumer/*

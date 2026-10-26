@@ -1,0 +1,8 @@
+# The documents' example harnesses (EN-03.5). Each harness and the .inc its
+# document generates are one translation unit split across two files, so two
+# checks cannot read them as written; both are registered standing deviations in
+# docs/deviations.md. Every other check applies.
+InheritParentConfig: true
+Checks: >
+  -misc-include-cleaner,
+  -misc-use-internal-linkage

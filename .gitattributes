@@ -1,0 +1,13 @@
+# Text files are stored and checked out with LF, so CRLF churn from Windows
+# tooling never reaches a diff.
+* text=auto eol=lf
+
+# Binary types git must not touch.
+*.pdf binary
+*.uf2 binary
+*.elf binary
+*.bin binary
+*.hex binary
+*.png binary
+*.jpg binary
+*.tgz binary

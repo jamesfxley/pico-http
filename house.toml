@@ -1,0 +1,76 @@
+family = "infra"
+
+[house]
+platform = "infra/house"
+languages = ["cxx", "python"]
+licence = "MIT"
+
+[packages.root]
+path = "."
+consumer_executables = ["consumer_smoke"]
+[packages.root.modes]
+host = "build-test-install"
+firmware = "build-install"
+
+[[packages.root.consumer_cases]]
+name = "default"
+tree = "host"
+producer_args = ["-DPICO_HTTP_PROFILE=default"]
+expect = "runs"
+
+[[packages.root.consumer_cases]]
+name = "p8-rp2350"
+tree = "host"
+producer_args = ["-DPICO_HTTP_PROFILE=p8-rp2350"]
+consumer_args = ["-DCMAKE_CXX_FLAGS=-DEXPECT_P8"]
+expect = "runs"
+
+[[packages.root.consumer_cases]]
+name = "pico-w-refused"
+tree = "firmware"
+source = "tests/consumer-board"
+consumer_args = ["-DPICO_BOARD=pico_w"]
+expect = "fails"
+stage = "consumer-configure"
+message = "PICO_HTTP needs PICO_PLATFORM rp2350"
+
+[[packages.root.consumer_cases]]
+name = "pico2-refused"
+tree = "firmware"
+source = "tests/consumer-board"
+consumer_args = ["-DPICO_BOARD=pico2"]
+expect = "fails"
+stage = "consumer-configure"
+message = "PICO_HTTP needs a board with the CYW43 radio"
+
+[[packages.root.consumer_cases]]
+name = "lwipopts-required"
+tree = "firmware"
+producer_args = ["-DPICO_LWIPOPTS_TARGET="]
+expect = "fails"
+stage = "producer-configure"
+message = "PICO_LWIPOPTS_TARGET must name the target"
+
+[ci.axes]
+profile = "PICO_HTTP_PROFILE"
+lwipopts = "PICO_LWIPOPTS_TARGET"
+ssid = "PICO_HTTP_WIFI_SSID"
+password = "PICO_HTTP_WIFI_PASSWORD"
+
+[[ci.require]]
+group = "build"
+matrix = { build_type = ["Debug", "Release"], sanitize = ["ON"], profile = ["default", "p8-rp2350"], lwipopts = ["pico_http_lwipopts_fallback"], ssid = ["placeholder-ssid"], password = ["placeholder-password"] }
+
+[[ci.require]]
+group = "lint"
+matrix = { sanitize = ["ON"], lwipopts = ["pico_http_lwipopts_fallback"], ssid = ["placeholder-ssid"], password = ["placeholder-password"] }
+prepare = ["python3 dev.py build"]
+
+[[ci.require]]
+group = "firmware"
+matrix = { board = ["pico2_w"], profile = ["default", "p8-rp2350"], lwipopts = ["pico_http_lwipopts_fallback"], ssid = ["placeholder-ssid"], password = ["placeholder-password"] }
+prepare = ["python3 dev.py build", "python3 dev.py gate build-warnings"]
+
+[[ci.require]]
+group = "consumer"
+matrix = { lwipopts = ["pico_http_lwipopts_fallback"] }

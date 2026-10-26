@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.26)
+include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
+project(pico_http_consumer_board LANGUAGES C CXX ASM)
+pico_sdk_init()
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../.. library)

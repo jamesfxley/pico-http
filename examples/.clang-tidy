@@ -1,0 +1,16 @@
+# Library-owned scope configuration inheriting the House-synced root.
+InheritParentConfig: true
+
+Checks: >
+  -modernize-avoid-c-arrays,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -cppcoreguidelines-pro-type-vararg,
+  -readability-magic-numbers
+
+# The benchmark reports over stdio with printf/snprintf into stack char
+# buffers, so the three C-array/vararg checks fire on every report line; the
+# alternative (iostreams or std::format) pulls in allocation and code size that
+# the firmware image is measured against by the footprint gate. Literal sizes
+# and durations are the benchmark's parameters, not constants shared with
+# anything else, so naming them adds indirection without removing a magic
+# number.

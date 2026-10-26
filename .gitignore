@@ -1,0 +1,67 @@
+# --- Build output ---
+build/
+build-*/
+out/
+install*/
+cmake-build-*/
+
+# --- CMake / CTest ---
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+_deps/
+
+# --- Pico SDK / firmware artifacts ---
+*.uf2
+*.elf
+*.elf.map
+*.bin
+*.hex
+*.dis
+
+# --- VSCode ---
+# Editor configuration is in the generated devcontainer customizations.
+.vscode/*
+.vscode/ipch/
+.vscode/browse.vc.db*
+
+# --- clangd ---
+.cache/
+.clangd/
+
+# --- C++ object/binary artifacts ---
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+*.app
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*venv/
+
+# --- Credentials, logs, tool reports ---
+.env
+*.log
+clang-tidy.sarif
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# --- Generated here ---
+docs/api/
+examples/bench/results/

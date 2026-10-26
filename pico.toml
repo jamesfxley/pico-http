@@ -1,0 +1,22 @@
+name = "pico-http"
+
+[infra]
+repository = "https://github.com/jamesfxley/pico-tooling.git"
+
+[[footprint]]
+name = "bench"
+when = { profile = "default" }
+elf = "build-firmware/examples/bench/pico_http_bench.elf"
+ram_kib = 104
+flash_kib = 448
+owned_prefix = "."
+owned_kib = 48
+
+[[footprint]]
+name = "bench p8-rp2350"
+elf = "build-firmware/examples/bench/pico_http_bench.elf"
+ram_kib = 130
+flash_kib = 448
+owned_prefix = "."
+owned_kib = 48
+when = { profile = "p8-rp2350" }

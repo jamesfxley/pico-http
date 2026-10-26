@@ -1,0 +1,9 @@
+# Library-owned scope configuration inheriting the House-synced root.
+InheritParentConfig: true
+
+Checks: >
+  -readability-magic-numbers
+
+# Literal sizes, offsets, counts and timestamps in a test are the case under
+# test, not a value shared with production code; hoisting each to a named
+# constant moves the expected value away from the assertion that reads it.
