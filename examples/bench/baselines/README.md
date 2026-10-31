@@ -1,8 +1,9 @@
-# Committed benchmark baselines
+# Benchmark baselines
 
-Recorded `bench.py` measurements for review. A committed run keeps its
-timestamp, firmware identity, profile, build type, board and conditions, and is
-never replaced to obtain a verdict.
+This directory holds recorded `bench.py` measurements for review. None is
+committed yet (FW-4). A committed run will keep its timestamp, firmware
+identity, profile, build type, board and conditions, and is never replaced to
+obtain a verdict.
 
 ## Review
 
@@ -41,8 +42,8 @@ AR-3 evidence. Each run records its build type, profile and board in a
 
 ## Baselines
 
-No reference record on 0.1.0 is committed yet. Each awaits a separately
-authorized bench run on a Pico 2 W:
+No reference record on 0.1.0 is committed yet (FW-4). The files this directory
+is meant to hold:
 
 | File | Profile | Build | Suite |
 |---|---|---|---|

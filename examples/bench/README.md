@@ -68,13 +68,13 @@ python3 bench.py --host 192.168.1.42 --tests t1,t3,t6
 python3 bench.py --host 192.168.1.42 --tests t7 --duration 300   # soak
 ```
 
-Results print as a table and are saved to `results/bench-<timestamp>.json`
-(the `results/` directory is git-ignored; reference runs are promoted to the
-committed [baselines/](baselines/)). All tests run by default except **t7**
-(soak — opt in and set the length with `--duration`), **t14** (timeout
-precision — slow), **t17** (body-mode comparison), **t18** (copied-body heap
-mechanism — long and heap-heavy) and **t21** (abuse run — 1,000 connections,
-long). Tests:
+Results print as a table and are saved to `results/bench-<timestamp>.json` (the
+`results/` directory is git-ignored; reference runs are promoted to
+[baselines/](baselines/), where none is committed yet (FW-4)). All tests run by
+default except **t7** (soak — opt in and set the length with `--duration`),
+**t14** (timeout precision — slow), **t17** (body-mode comparison), **t18**
+(copied-body heap mechanism — long and heap-heavy) and **t21** (abuse run —
+1,000 connections, long). Tests:
 
 - **t1** latency — sequential `GET /ping` over keep-alive (p50/p90/p99, rps,
   TTFB split; spec PR-1/PR-2); mechanises PR-2's internal share from the device's

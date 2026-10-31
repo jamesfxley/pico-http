@@ -7,6 +7,7 @@
 | [technical-specification.md](technical-specification.md) | **Normative.** Scope, platform constraints, resource budgets, and every requirement (`AR`/`PR`/`RR`/`BR`/`TR`/`NR`/`OR`) with its pass criterion. | Deciding what the library must do, or citing a requirement from code |
 | [architecture.md](architecture.md) | How the implementation works, layer by layer: modules, connection identity, the RX and TX paths, timeouts, teardown. | Changing the internals |
 | [usage-guide.md](usage-guide.md) | Practical usage: setup, routes, the three body modes, framing, limits, host testing. | Building an application on the library |
+| [future-work.md](future-work.md) | Work deliberately not done, one entry per deferral, with its reason and cost (`EN-03.7`) | Asking whether something absent is planned, or before proposing a feature |
 | [deviations.md](deviations.md) | Standing (scope-wide) deviations from the coding standard, each with a rationale, a risk assessment and a review date | Adding or reviewing a suppression |
 | [deviation-budget.txt](deviation-budget.txt) | One suppression ceiling per language, ratcheting down. These only ever ratchet down | Same |
 | [requirement-prefixes.txt](requirement-prefixes.txt) | The pinned prefix set, checked by review (EN-02.4) | Adding a requirement under a new prefix |
@@ -27,12 +28,13 @@ guide and the README is compiled from the document itself by `tests/docs/`, so
 an example that stops building fails the build.
 
 Measured results are not in this directory. Device runs and the conditions they
-were captured under are the run record, and live with the benchmark:
-[examples/bench/baselines/](../examples/bench/baselines/).
+were captured under are the run record, and will live with the benchmark:
+[examples/bench/baselines/](../examples/bench/baselines/). None is committed
+yet (FW-4).
 
 The specification is the only normative document here. `architecture.md`
-describes what is, and work deliberately not done is an issue in the tracker
-rather than a document in the tree (`EN-03.7`).
+describes what is, and work deliberately not done is in
+[future-work.md](future-work.md) (`EN-03.7`); the issue tracker holds defects.
 
 A behaviour claimed in `README.md` or `docs/orientation.md` but absent from the
 specification is not a commitment, and a requirement is not satisfied until the

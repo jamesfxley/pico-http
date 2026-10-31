@@ -7,9 +7,10 @@ boundary-safety, and observability requirements for the pico-http TCP/HTTP
 stack. Every requirement has an ID (`AR`/`PR`/`RR`/`BR`/`TR`/`NR`/`OR`) and is
 mapped to an acceptance test in the traceability matrix (§12).
 [architecture.md](architecture.md) describes the implementation; measured
-validation records live in
-[examples/bench/baselines/](../examples/bench/baselines/).
-Cryptographic layers (TLS/HTTPS) are out of scope (§1).
+validation records will live in
+[examples/bench/baselines/](../examples/bench/baselines/); none is committed
+yet (FW-4).
+Cryptographic layers (TLS/HTTPS) are out of scope (§1; server-side TLS: FW-3).
 
 ---
 
@@ -17,10 +18,10 @@ Cryptographic layers (TLS/HTTPS) are out of scope (§1).
 
 | | |
 |---|---|
-| Hardware targets | **Supported (validated):** Pico 2 W (RP2350, 520 KB SRAM). The Pico W (RP2040) is refused at configure: pico-logging's atomics are not lock-free on ARMv6-M. Both named profiles are sized for the Pico 2 W |
+| Hardware targets | **Supported:** Pico 2 W (RP2350, 520 KB SRAM); its 0.1.0 validation record is pending (FW-4). The Pico W (RP2040) is refused at configure: pico-logging's atomics are not lock-free on ARMv6-M (FW-1). Both named profiles are sized for the Pico 2 W |
 | Network stack | lwIP **raw API** only (`NO_SYS=1`, `LWIP_SOCKET=0`, `LWIP_NETCONN=0`) via `pico_cyw43_arch_lwip_threadsafe_background` |
 | Protocol | HTTP/1.1 server subset defined in §9; HTTP/1.0 clients supported |
-| Out of scope | TLS/HTTPS; HTTP/2+; client-side HTTP; **off-core handler execution** (AR-9's deferred-completion contract is written to admit it, but no off-core executor is provided; lwIP raw is single-context regardless, so the transport, parser and response writer stay on the async-context core); NTP/wall-clock time (`to_ms_since_boot` suffices; the `pico-time` sibling stays unlinked) |
+| Out of scope | TLS/HTTPS (server-side TLS: FW-3); HTTP/2+; client-side HTTP; **off-core handler execution** (AR-9's deferred-completion contract is written to admit it, but no off-core executor is provided (FW-2); lwIP raw is single-context regardless, so the transport, parser and response writer stay on the async-context core); NTP/wall-clock time (`to_ms_since_boot` suffices; the `pico-time` sibling stays unlinked) |
 
 Two named configuration profiles parameterize every numeric limit in this document:
 
@@ -33,8 +34,8 @@ names and by the `PICO_HTTP_*` header caps (§3.5) and MSS factors (§3.4), so d
 can define their own profile; the two named profiles are the ones this project validates.
 
 **API stability:** the public API (`namespace pico_http`, headers under
-`pico_http/`) follows semantic versioning; breaking changes only at a major
-version.
+`pico_http/`) follows semantic versioning; a breaking change lands at a minor
+bump while the major version is 0, and at a major bump from 1.0.
 
 Three API contracts referenced throughout this document:
 
@@ -268,7 +269,7 @@ rejection and the storage never disagree.
 | **AR-9** | **Deferred completion.** A handler may return `Disposition::PENDING` and resolve the request later via `respond(RequestId, ResponseFiller, void*)`. For the whole deferred window the request views (method, URI, headers, body) stay valid and the connection consumes no further pipelined request — buffered bytes hold the receive window closed against the peer exactly as they do behind a backpressured response (AR-6), so a deferring handler applies backpressure rather than accumulating work. The handler does **not** hold the response object across the window: it supplies a filler that the service invokes at completion time, and only if the request is still live, so a late completion cannot write into a recycled entry. `RequestId` is request-scoped — {generation-tagged connection id, request sequence} — so a completion arriving after the connection timed out, was reset, or was reclaimed by a server stop is inert (AR-4), and one arriving after that same connection has begun a later request cannot resolve that later request instead; a second `respond()` for the same request is likewise inert. `respond()` allocates nothing, makes no lwIP call and performs no send: it records the completion under a bounded critical section (AR-3) and signals the async-context, which sends on its next turn. It is therefore safe from any context, including core 1 and an ISR. The deferred window is bounded by TR-6, the number of concurrent deferrals by BR-12. |
 | **AR-10** | **The application owns `lwipopts.h`.** This library asserts what it requires of a configuration and provides none. lwIP admits one configuration per image and the SDK compiles lwIP into whichever target links its INTERFACE libraries, so a library supplying one gives an application linking two networking libraries two lwIP builds whose struct layouts disagree, resolved by archive order (`CXX-10.3`). A firmware configure fails unless `PICO_LWIPOPTS_TARGET` names the application's target — the variable is the family's, so an application linking pico-http and a sibling names its configuration once. The requirements are §3.2, each a `static_assert` in a single translation unit, so an inadequate configuration is a compile error naming the setting rather than a fault under load. |
 | **AR-11** | **A caller-owned body declares its lifetime in its type.** `set_body_static` takes a `StaticBody`, which only `StaticBody::outliving_response()` constructs, and whose name is the caller's assertion, written at the call site rather than made silently by a conversion. A `std::span` or `std::string_view` does not convert, so a view into `HTTPRequestView` cannot be served as a static body. That storage is the connection's parser buffer, recycled when the handler returns, and the writer re-reads a static body on every backpressure resume -- potentially long after that. |
-| **AR-12** | **A board without an RP2350 and the CYW43 radio is refused at configure.** The server runs over the radio, and pico-logging needs the RP2350's exclusive access, so the library declares `PLATFORM rp2350 CYW43` to pico-tooling's bootstrap, which refuses a board without what a library declares. A consumer adding it on such a board fails at configure, naming what the board lacks, rather than in the build or on the device. |
+| **AR-12** | **A board without an RP2350 and the CYW43 radio is refused at configure.** The server runs over the radio, and pico-logging needs the RP2350's exclusive access, so the library declares `PLATFORM rp2350 CYW43` to pico-tooling's bootstrap, which refuses a board without what a library declares. A consumer adding it on such a board fails at configure, naming what the board lacks, rather than in the build or on the device. The Pico W (RP2040) is therefore refused at configure (FW-1). |
 
 ## 5. Performance requirements (PR)
 
