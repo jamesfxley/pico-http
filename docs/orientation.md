@@ -56,8 +56,8 @@ separate hardware evidence; see examples/bench/README.md.
 - `src/include/pico_http/pico_http.hpp` — the umbrella, belonging to no module
   (`CXX-13.1`).
 - `docs/` — normative spec (requirement IDs `AR/PR/RR/BR/TR/NR/OR`),
-  architecture and usage guide. Work deliberately not done is an issue
-  (`EN-03.7`), not a document.
+  architecture and usage guide. Work deliberately not done is in
+  `docs/future-work.md` (`EN-03.7`).
 
 ## Conventions
 

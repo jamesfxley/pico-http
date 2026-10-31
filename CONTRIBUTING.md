@@ -26,8 +26,9 @@ with stable requirement IDs. Keep documents about the current state. Source
 files carry the SPDX identifier for the [licence](LICENSE).
 
 Issue titles state an observable fact, without type prefixes. Discuss substantial
-changes before implementation, and record deliberately deferred work in the
-tracker. Security-sensitive reports follow [SECURITY.md](SECURITY.md).
+changes before implementation, and record deliberately deferred work in
+`docs/future-work.md` (`EN-03.7`); the tracker holds defects. Security-sensitive
+reports follow [SECURITY.md](SECURITY.md).
 
 Review refusal tests for the expected finding text as well as the exit status.
 A crash returning the same status must never satisfy a negative control.

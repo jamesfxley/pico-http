@@ -135,19 +135,20 @@ independent knobs (`PICO_HTTP_MAX_HEADER_NAME` /
 
 The on-device bench suite covers chunked request decode,
 `Expect: 100-continue`, slowloris/timeout defenses, RST robustness and zero
-post-init heap growth on a Pico 2 W (RP2350). Reference records are committed in
-[examples/bench/baselines/](examples/bench/baselines/); no 0.1.0 run is recorded
-yet. Some tests record numbers without a verdict;
+post-init heap growth on a Pico 2 W (RP2350). No reference records are committed yet;
+they will live in [examples/bench/baselines/](examples/bench/baselines/)
+(FW-4). Some tests record numbers without a verdict;
 [examples/bench/baselines/README.md](examples/bench/baselines/README.md) names
 them, and "green" is a claim about the tests that adjudicate.
 
 - **Supported target: Pico 2 W (RP2350).** The Pico W (RP2040) is refused at
-  configure: pico-logging's atomics are not lock-free on its ARMv6-M core.
+  configure: pico-logging's atomics are not lock-free on its ARMv6-M core
+  (FW-1).
 - **Copied-body allocation is bounded, not zero** — a copied `set_body` holds
   its body in the connection slot until sent, and one over `MAX_BUFFERED_BODY`
   is answered `500` instead; static and generator bodies allocate zero. The
   bound is AR-1's, with BR-14.
-- **Second-core handler execution and server-side TLS** are outside the supported surface.
+- **Second-core handler execution and server-side TLS** are outside the supported surface (FW-2, FW-3).
 
 ## Documentation
 
@@ -172,7 +173,8 @@ them, and "green" is a claim about the tests that adjudicate.
 
 ## Releases
 
-Versioning is semver: breaking changes only at a major version. The notes on
+Versioning is semver: a breaking change lands at a minor bump while the major
+version is 0, and at a major bump from 1.0. The notes on
 each [release](https://github.com/jamesfxley/pico-http/releases) record what
 changed and, for a break, what to change in your own code (`EN-06.3`).
 

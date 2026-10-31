@@ -278,9 +278,9 @@ its cap in BR-14. `set_body_static` and `set_body_generator` allocate nothing.
 | HTTP service (backpressure, keep-alive, timeouts, errors) | ✔ against `FakeTcpTransport` | t1–t22 |
 | lwIP glue (`LwipTcpTransport`) | — | t1 receive-callback timing (PR-2), t8 RST robustness, t9 slowloris, t11 256 KB download, t14 timeout precision, t22 every receive window held at once |
 
-Hardware validation runs on a Pico 2 W; reference records are committed in
-[baselines](../examples/bench/baselines/), and the on-device
-[benchmark suite](../examples/bench/README.md) produces them.
+Hardware validation runs on a Pico 2 W; reference records will live in
+[baselines](../examples/bench/baselines/) (none is committed yet, FW-4), and the
+on-device [benchmark suite](../examples/bench/README.md) produces them.
 
 ## What this is not
 
@@ -292,7 +292,7 @@ connection past the request that opened it, and wall-clock time is a dependency
 this library deliberately does not carry — a consumer needing it owns that,
 which is what pico-time is for.
 
-Server-side TLS is outside the supported surface.
+Server-side TLS is outside the supported surface (FW-3).
 
 
 ## Transmit-ring credit bounds
