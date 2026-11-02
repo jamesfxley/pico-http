@@ -25,6 +25,14 @@ recorded deviation. Change behaviour, its specification and its tests together,
 with stable requirement IDs. Keep documents about the current state. Source
 files carry the SPDX identifier for the [licence](LICENSE).
 
+A pull request states its verification by level, as its template asks
+(`EN-07.8`): host, target build and device, each with what ran and what it
+printed, or "Not run" with the reason and what it leaves unverified. A change
+to code compiled only for a target passes its device tests on that target
+before merge (`EN-06.9`). A change that claims or risks a measured figure runs
+its benchmarks before merge (`EN-06.10`). A defect seen on a target names the
+board, the firmware commit and the wiring where it matters.
+
 Issue titles state an observable fact, without type prefixes. Discuss substantial
 changes before implementation, and record deliberately deferred work in
 `docs/future-work.md` (`EN-03.7`); the tracker holds defects. Security-sensitive

@@ -3,8 +3,8 @@
 # Include before project(). A parent's family context wins; otherwise this
 # checkout's infra/, otherwise one fetch of the pinned infrastructure chain.
 set(PICO_FAMILY_INFRA_REPOSITORY "https://github.com/jamesfxley/pico-tooling.git")
-set(PICO_FAMILY_INFRA_REVISION "23b5fa1ad45bf14f5c02faa1ce38430cd6c74c2c")
-set(PICO_FAMILY_INFRA_VERSION "0.1.1")
+set(PICO_FAMILY_INFRA_REVISION "5a9408356ecd78beb4e325e8e183be72a77c1fce")
+set(PICO_FAMILY_INFRA_VERSION "0.1.2")
 get_property(_pico_family_root GLOBAL PROPERTY PICO_FAMILY_ROOT)
 if(NOT _pico_family_root)
     if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../infra/cmake/pico_family.cmake")

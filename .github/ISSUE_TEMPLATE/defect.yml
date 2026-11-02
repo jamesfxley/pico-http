@@ -26,9 +26,21 @@ body:
     validations:
       required: true
   - type: textarea
-    id: environment
+    id: where-it-runs
     attributes:
-      label: Environment
-      description: The operating system, tool versions and the commit or release, where they matter.
+      label: Where it runs
+      description: >-
+        Host: the operating system and tool versions, where they matter.
+        Target: the board, the firmware commit or release, and the wiring
+        where it matters.
+      placeholder: host
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The console or command output that shows it.
+      render: text
     validations:
       required: false
