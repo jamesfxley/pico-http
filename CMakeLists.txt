@@ -94,7 +94,17 @@ set(PICO_LWIPOPTS_TARGET "" CACHE STRING "Target carrying the application's lwip
 set(PICO_HTTP_WIFI_SSID "" CACHE STRING "Wi-Fi SSID the example firmware should join")
 set(PICO_HTTP_WIFI_PASSWORD "" CACHE STRING "Wi-Fi password (WPA2-PSK)")
 
+# The standalone device-test application offers a whole-build lwIP configuration
+# (AR-10). Select it explicitly for board runs; keep the CI fallback unchanged.
+if(PROJECT_IS_TOP_LEVEL AND PICO_HTTP_BUILD_FIRMWARE)
+    include(tests/device/lwipopts.cmake)
+endif()
+
 add_subdirectory(src)
+
+if(PROJECT_IS_TOP_LEVEL AND PICO_HTTP_BUILD_FIRMWARE)
+    add_subdirectory(tests/device)
+endif()
 
 if(PICO_HTTP_ENABLE_TESTS)
     house_cxx_enable_gtest()
@@ -127,6 +137,12 @@ if(PICO_HTTP_ENABLE_INSTALL)
         pico_http_tcp
         pico_http_http
     )
+
+    # Internal export needed for the static library link closure. Its device
+    # include paths and options are build-only, not an installed module API.
+    if(TARGET pico_http_device_lwipopts)
+        list(APPEND PICO_HTTP_EXPORT_TARGETS pico_http_device_lwipopts)
+    endif()
 
     # The export set is what this configuration actually built, and the two
     # configurations differ at both ends. The lwIP transport is firmware-only:
