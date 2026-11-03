@@ -104,6 +104,26 @@ commands. Device benchmarks are separate from build and static-footprint checks.
 Host tests are configured only when pico-http is the top-level project and
 not cross-compiling.
 
+`tests/device/` provides four autonomous TCP loopback cases for AR-5, AR-6,
+RR-3 and AR-9. They cover the lwIP glue, bypassing the CYW43 Wi-Fi path; no
+Wi-Fi join or credentials are used by the image. Select its application-owned
+lwIP configuration for the whole firmware build:
+
+```sh
+HOUSE_MATRIX_PROFILE=default \
+HOUSE_MATRIX_LWIPOPTS=pico_http_device_lwipopts \
+HOUSE_MATRIX_SSID=placeholder-ssid \
+HOUSE_MATRIX_PASSWORD=placeholder-password \
+python3 dev.py build --tree firmware
+```
+
+The placeholder credentials satisfy the separately built benchmark's configure
+contract. Run `build-firmware/tests/device/pico_http_device_tests.uf2` using the
+[device-test procedure](infra/guides/device.md#device-tests). The fallback CI
+configuration builds the image but makes its cases report FAIL for missing
+loopback options. The `pico_http::device_lwipopts` export is internal link
+support; it is not an installed public module target.
+
 ## Sizing profiles
 
 Every static allocation is sized from a compile-time profile. Two are shipped;

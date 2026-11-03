@@ -20,3 +20,21 @@ flash_kib = 448
 owned_prefix = "."
 owned_kib = 48
 when = { profile = "p8-rp2350" }
+
+[[footprint]]
+name = "device tests"
+when = { profile = "default" }
+elf = "build-firmware/tests/device/pico_http_device_tests.elf"
+ram_kib = 160
+flash_kib = 256
+owned_prefix = "."
+owned_kib = 64
+
+[[footprint]]
+name = "device tests p8-rp2350"
+when = { profile = "p8-rp2350" }
+elf = "build-firmware/tests/device/pico_http_device_tests.elf"
+ram_kib = 192
+flash_kib = 256
+owned_prefix = "."
+owned_kib = 64

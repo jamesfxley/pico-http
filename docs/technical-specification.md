@@ -438,11 +438,11 @@ them; review checks these citations (EN-02.1).
 | AR-2 | Review of the RX and TX paths; `t17` compares the body modes | RX copies each byte pbuf→assembly buffer, the head through the parser's scratch into its stored fields, and a body once more into the parser's body buffer; TX copies each body source once into the static ring and writes from it without `TCP_WRITE_FLAG_COPY`, buffered mode adding `set_body`'s copy (and the over-reserved trim). Review-only: no runtime counter exists |
 | AR-3 | t5 on a Debug build | **Device-internal; mechanised.** p99 lock hold ≤ 500 µs under 8-connection load. A Release build compiles the sampler out, and `t5` reports AR-3 there as not measured (`ar3_measured` false) rather than claiming a pass |
 | AR-4 | `pico_http_tcp_tests` | Stale-handle/ABA tests: generation mismatch → no-op |
-| AR-5 | t11, t12, `pico_http_http_tests` | 256 KB bit-exact; slow reader isolated; resume-after-ack unit tests |
-| AR-6 | t13, `pico_http_http_tests` | Throttle counter > 0 under stall, zero corruption; consume/window unit tests |
+| AR-5 | t11, t12, `pico_http_http_tests`; `tests/device/main.cpp` — `tcp-ack-resumes-complete-response` | 256 KB bit-exact; slow reader isolated; resume-after-ack unit tests. Device case: withhold peer receive credit until the real TCP window fills and the response writer reports backpressure, then release credit; the peer receives the exact deterministic body of three TX rings through EOF. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
+| AR-6 | t13, `pico_http_http_tests`; `tests/device/main.cpp` — `tcp-window-reopens-after-consumption` | Throttle counter > 0 under stall, zero corruption; consume/window unit tests. Device case: park the first request PENDING while a known pipeline longer than TCP_WND arrives; require rx_window_throttle_events > 0 and the peer sender window to reach zero before releasing the pending request, then receive every complete numbered response in order with rx_overflow_drops = 0. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
 | AR-7 | `pico_http_tcp_tests` | Deadline tests across the 2³² ms wrap boundary |
 | AR-8 | t1 | **Network-measured; review.** Record the latency distribution and assess modes or jumps against earlier matched runs and RF health; ~200 ms delayed-ACK behavior is a documented expectation to investigate, not a numerical gate. The Nagle-disable implementation remains required. |
-| AR-9 | `pico_http_http_tests`, t19 | View lifetime across the deferred window; pipelining held; stale and duplicate `respond()` inert. t19 mechanises positive work and dispatches covering completions, no heavy errors/timeouts and no stranded entries. Its offered-load ratio, client-observed synchronous/deferred p99, improvement and 40 ms expectation are network-measured review evidence. |
+| AR-9 | `pico_http_http_tests`, t19; `tests/device/main.cpp` — `irq-deferred-completion-runs-on-async-context` | View lifetime across the deferred window; pipelining held; stale and duplicate `respond()` inert. t19 mechanises positive work and dispatches covering completions, no heavy errors/timeouts and no stranded entries. Its offered-load ratio, client-observed synchronous/deferred p99, improvement and 40 ms expectation are network-measured review evidence. Device case: a 10 us repeating timer and mainline race different fillers for one real parked request. Exactly one eligible publisher succeeds, one filler runs under the SDK async-context lock and the peer receives exactly the winning body. Require 256 observed IRQ landings inside the mainline respond bracket; coverage is statistical, not proof of every interleaving. A fresh unanswered request is torn down; its completion then returns false without running its filler. A new connection must reuse that slot with a different generation; the stale id stays inert before and during its parked request, emits no bytes, and the live request completes normally. The bounded sampling interval and conservative instruction-count derivation are described below. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
 | AR-10 | `lwipopts_assertions.hpp` in `lwip_tcp_transport.cpp`; the `consumer` gate cases in `house.toml`; case `lwipopts-required` at producer-configure, expecting `PICO_LWIPOPTS_TARGET must name the target` | Every §3.2 relation is a `static_assert`; the configure is refused with a diagnostic naming the variable; no target puts an `lwipopts.h` on the include path unless it is named |
 | AR-11 | Compiler; `pico_http_http_tests` -- `ARequestViewCannotBecomeAStaticBody` | `set_body_static(request.body, ...)` does not compile: `cannot convert 'std::span<const unsigned char>' to 'pico_http::StaticBody'`. The test asserts the property the diagnostic rests on -- that neither a span nor a string view converts -- so a conversion added later fails there rather than silently restoring the trap. |
 | AR-12 | the `consumer` gate cases `pico-w-refused` and `pico2-refused`, a consumer adding the library | On `pico_w` the configure fails saying `PICO_HTTP needs PICO_PLATFORM rp2350`; on `pico2`, saying `PICO_HTTP needs a board with the CYW43 radio` |
@@ -457,7 +457,7 @@ them; review checks these citations (EN-02.1).
 | PR-9 | t20 | **Network-measured; review.** Record worst inter-read gap and comparison with history. The documented expectation is `2 * tcp_rto_ms / 1000 + 0.25` seconds; it and the recorded 10% reference comparison are informational, not limits. Complete transfers and allocation checks remain mechanised. |
 | RR-1 | t8 | 0 slots leaked after 100 RSTs; immediate full-capacity accept |
 | RR-2 | t21 | After 1,000 events rotating through a peer RST mid-request, a malformed request line (`400`), a header line over the cap (`431`) and a slowloris head, a fresh client's `/ping`, timed from connect to the full response, completes within 1 s while two slowloris heads still hold their slots, and the device reclaims those through the header timeout; every abuse request gets its expected status |
-| RR-3 | t5 | 9th connection refused; 8 existing unaffected |
+| RR-3 | t5; `tests/device/main.cpp` — `tcp-refuses-one-past-slot-cap` | 9th connection refused; 8 existing unaffected. Device case: hold the active profile MAX_CONNECTIONS live peers; one more gets ERR_RST with no HTTP bytes, refusals_slot_full increments once, and every original peer still receives its exact response. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
 | RR-4 | t7, t21; `pico_http_http_tests` — `TheCountersAccountForEveryConnection` | t7 under mixed load and t21 under abuse, each recording its duration: no request errors (t7), no allocation lwIP refused from its heap or its pbuf, segment and `PBUF_ROM` pools (t7; `/lwip_stats` `err`), heap inside AR-1's bound (both) and flat (t7), every slot free once the load stops (`active_connections` back to the measuring connection within 20 s), and `accepts` plus the connections open at the reset (reported by `/stats/reset`) equal every disconnect reason plus `active_connections`, the timeout total its kinds and `parse_errors` its classes. The host case holds the same identities across every close path |
 | RR-5 | t6 | Reuse rate ≥ 99 %, adjudicated by the run: every request after the first on a connection and within the keep-alive limit counts as one relying on reuse, so a server closing early lowers the rate rather than shortening the denominator |
 | RR-6 | t22 | Every slot at once holds a backpressured 64 KiB download with 8 KiB of requests pipelined behind it, more than any profile's receive window; then every response is bit-exact and complete, `rx_window_throttle_events` is at least `MAX_CONNECTIONS`, `rx_overflow_drops` is 0, lwIP refused no allocation from its heap or its pbuf, segment and `PBUF_ROM` pools, and the device still serves. The pool's high-water mark since boot and `tcp.memerr`, which also counts writes refused for a full send queue, are recorded beside the verdict |
@@ -485,3 +485,41 @@ them; review checks these citations (EN-02.1).
 | OR-2 | Review of `handle_stats` and `register_routes` in `examples/bench/main.cpp`; device bench stats deltas and resets; `consumer` cases `default` and `p8-rp2350` run `consumer_smoke` | GET /stats reports the counters and POST /stats/reset resets them. Consumer cases prove installed profile linkage, not endpoint schemas. |
 | OR-3 | Device inspection of GET /limits; review of `handle_limits`; `consumer` cases `default` and `p8-rp2350` | JSON reports the compiled limits used by the boundary/timeout cases. The client can fall back when /limits is unavailable, so the complete field set needs review/device inspection. |
 | OR-4 | Device inspection of GET /info; review of `handle_info`; `consumer` cases `default` and `p8-rp2350` | JSON identity matches the built version, board, profile and lwipopts. The bench bootstrap reads /info; complete identity fields need review/device inspection. |
+
+### Device loopback evidence
+
+The autonomous `tests/device/` image uses `127.0.0.1`, not a joined Wi-Fi
+link. Build it with `HOUSE_MATRIX_PROFILE=default` and
+`HOUSE_MATRIX_LWIPOPTS=pico_http_device_lwipopts` using
+`python3 dev.py build --tree firmware`. The README gives the complete command;
+the family device-test procedure defines console attachment and the verdict.
+The fallback configuration builds a diagnostic image whose four cases FAIL.
+Each case has a bounded wait, and the image shares an 18.5 s deadline after
+console attachment. It emits no throughput or latency measurements.
+
+For AR-9, timer attempts are eligible only after the mainline arms the duplicate
+publisher for a parked request. The timer claims the arm with an exchange before
+attempting publication. Immediately after the bracketed `respond()`, the mainline
+masks interrupts and retires the arm with its own exchange before restoring
+interrupts. Thus eligibility ends either at the timer's claim or when mainline
+masks interrupts; no sleep, wait or network polling occurs in the eligible
+interval. The masked exchange retry loop contributes no IRQ-observable
+instructions. A trial missed by the timer still requires the exact mainline
+response, but contributes no landing. Only callbacks observing the bracket set
+count toward coverage.
+
+The Release RP2350 instruction-count model uses g <= 64 interrupts-enabled
+instructions outside the bracket per eligible interval and s >= 9 inside it.
+In both profiles, the outer routine has at most 13 instructions through the
+IRQ-mask instruction, and the inner routine has at most 12 marker/prologue/
+epilogue instructions outside the operation. Counting even setup before arming
+gives an upper bound of 25; rounding up to 64 leaves margin. The bounds are
+checked against the linked `race_publishers` and `mainline_complete`
+disassembly in both profiles. Seven argument setup
+instructions and the call inside the bracket, plus the first instruction of
+`respond()` before it masks interrupts, provide the lower bound of nine;
+remaining enabled instructions in `respond()` are omitted. Thus q <= 64/73
+and q^256 <= 2.352e-15, below 1e-9. The model assumes independent interrupt phases across
+attempts. Requiring 256 observed landings provides statistical coverage, not
+proof of every interleaving. The case fails if its deadline or attempt cap is
+reached without enough landings; failure reports the attempt and landing counts.
