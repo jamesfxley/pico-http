@@ -2,13 +2,8 @@
 #pragma once
 
 /// \file pico_http.hpp
-/// pico-http umbrella header. Re-exports the primary abstractions, so a
-/// consumer can include this alone; including the specific components directly
-/// is equally supported where finer control over dependencies is wanted.
-///
-/// Host-safe: the firmware-only pieces (LwipTcpTransport, the
-/// make_http_service() definition) live behind
-/// pico_http/tcp/lwip_tcp_transport.hpp and the firmware build of the library.
+/// Host-safe umbrella header. The lwIP transport and factory definition
+/// require firmware.
 
 // The umbrella re-exports every module.
 // IWYU pragma: begin_exports

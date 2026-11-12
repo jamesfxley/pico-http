@@ -21,29 +21,13 @@
 #include "pico_http/tcp/tcp_transport.hpp"
 
 /// \file http_service.hpp
-/// HTTP/1.1 server on ITcpTransport. Per-connection state lives in a fixed
-/// slot array indexed by ConnectionId; requests are parsed incrementally
-/// (HttpParser) and responses stream out through credit-based sends that
-/// resume on writable events — so a response is never silently truncated
-/// regardless of size (AR-5). Request boundary violations map to
-/// 400/413/414/417/431/501/505 with Connection: close (BR-1..BR-11), a
-/// deferral past its cap to 503 (BR-12) and an oversized response head or
-/// copied body to 500 (BR-13, BR-14). No lwIP
-/// dependency: firmware injects the lwIP transport, host tests inject
-/// FakeTcpTransport.
+/// HTTP service over a host-safe transport, with resumable output and
+/// explicit boundary errors (AR-5, BR-1..BR-11, BR-12, BR-13, BR-14).
 
 namespace pico_http {
 
-/// The profile-derived sizes a translation unit was compiled against.
-///
-/// The sizing profile is chosen by macros, and those macros change class
-/// layout — HttpService's slot array, HTTPHeaders' storage, the RX buffer. A
-/// consumer that compiles its own translation units with different macro values
-/// than the library archive was built with therefore disagrees with it about
-/// object layout, silently. CMake propagates the definitions as usage
-/// requirements so this cannot normally happen; this is the check for when it
-/// does anyway (a hand-rolled build, a stale prebuilt archive), because the
-/// failure mode is memory corruption with no other symptom.
+/// Compiled profile sizes used to detect incompatible caller and library
+/// layouts.
 struct ProfileBinding {
     /// Profile::MAX_CONNECTIONS, the slot-array extent.
     std::size_t max_connections;
@@ -57,16 +41,10 @@ struct ProfileBinding {
     /// HTTPHeaders::MAX_HEADER_VALUE (PICO_HTTP_MAX_HEADER_VALUE), the value
     /// storage.
     std::size_t header_value_capacity;
-    /// BR-12. Reported separately from conn_size below: the deferred-response
-    /// pool is a service member, not per-slot storage, so a disagreement about
-    /// it does not move the slot layout and the size comparison cannot see it.
+    /// Service-wide pool capacity, which a per-slot size comparison cannot
+    /// detect (BR-12).
     std::size_t max_pending_responses;
-    /// Size and alignment of the per-connection slot. The named knobs above are
-    /// the ones worth reporting individually, but they are not the only ones
-    /// that move this layout — HEAD_CAPACITY and GENERATOR_CHUNK size the
-    /// response writer, and the parser's scratch and fixed strings come from
-    /// MAX_URI, MAX_HEADER_LINE, MAX_METHOD and MAX_VERSION. Comparing the slot
-    /// itself covers every such knob, including any a downstream profile adds.
+    /// Slot size in bytes, covering profile sizes not compared individually.
     std::size_t conn_size;
     /// Alignment of the per-connection slot, paired with conn_size.
     std::size_t conn_align;
@@ -76,73 +54,33 @@ struct ProfileBinding {
     bool operator==(const ProfileBinding&) const = default;
 };
 
-// Implements ITransportEvents privately: the service is the transport's event
-// sink, but those methods are not part of its own API.
-/// The HTTP/1.1 server: routing, request parsing, response writing, keep-alive,
-/// per-phase timeouts and observability, over an ITcpTransport.
-///
-/// Statically allocated. Every buffer, the connection slot array and the
-/// deferred-response pool are sized at compile time from the active profile,
-/// and nothing is allocated after start() returns (AR-1) — so a capacity that
-/// cannot be met produces a status code (413, 431) rather than a truncated
-/// request or a failed allocation.
-///
-/// Construct it with a transport, add routes, then start(). A handler either
-/// fills the response and returns Disposition::COMPLETE, or returns
-/// Disposition::PENDING and resolves the request later through respond()
-/// (AR-9), which is what keeps handler CPU time off the transport's callback
-/// path.
-///
-/// Implements ITransportEvents privately: the service is the transport's event
-/// sink, but those methods are not part of its own API.
+/// HTTP service with fixed slot buffers. After start() only copied bodies
+/// allocate, within a bound (AR-1).
+/// Handlers complete inline or resolve later through respond() (AR-9).
 class HttpService : private ITransportEvents {
    private:
-    /// The compile-time sizing policy, selected via PICO_HTTP_ACTIVE_PROFILE
-    /// (config/profile.hpp). The concept states what a replacement must supply,
-    /// so a mis-specified downstream profile fails here rather than inside the
-    /// parser's instantiation.
+    /// The selected sizing policy. A replacement must satisfy HttpProfile.
     using Profile = PICO_HTTP_ACTIVE_PROFILE;
     static_assert(HttpProfile<Profile>,
                   "PICO_HTTP_ACTIVE_PROFILE must satisfy the HttpProfile "
                   "concept (see pico_http/config/profile.hpp)");
 
    public:
-    /// The active profile's boundary limits (BR-1..BR-5), exposed so an app
-    /// can report the real caps (e.g. /limits) rather than assuming the default
-    /// profile's — the two differ under, e.g., -DPICO_HTTP_PROFILE=p8-rp2350.
+    /// Active parser limits for reporting the configured capacities
+    /// (BR-1..BR-5).
     using Limits = typename Profile::Limits;
 
-    /// Generation-tagged connection handle (AR-4). Public because respond()
-    /// takes one: a deferring handler holds it across the wait.
+    /// Generation-tagged transport connection handle (AR-4).
     using ConnectionId = ITcpTransport::ConnectionId;
 
-    /// A route handler. Fills `response` and returns Disposition::COMPLETE, or
-    /// returns Disposition::PENDING having taken responsibility for calling
-    /// respond() later (AR-9).
-    ///
-    /// `response` is library-owned and valid **only for the duration of the
-    /// call**, in both cases. A handler must not keep the reference: the entry
-    /// returns to the pool when the handler returns, and another connection may
-    /// claim it immediately.
-    ///
-    /// A handler that returns PENDING therefore fills nothing here — anything
-    /// written to `response` before returning PENDING is discarded. It keeps
-    /// `request.request` (a RequestId) and later calls respond() with a filler,
-    /// which the service invokes against a fresh entry at completion time. That
-    /// is the whole reason the filler exists: with no reference to hold, a late
-    /// completion cannot write into an entry that now belongs to someone else.
-    ///
-    /// The request views (method, URI, headers, body) are valid for longer than
-    /// `response` is: to the handler's return for COMPLETE, and until the
-    /// request resolves for PENDING, because the parser is not reset while a
-    /// connection is parked.
-    /// Aliases the namespace-scope pico_http::RequestHandler, which the route
-    /// table also uses — one declaration, so the two cannot drift.
+    /// A handler completes inline or defers through respond() (AR-9).
+    /// A handler must not retain response beyond the call. Another connection
+    /// can claim it immediately. Request views last until return for COMPLETE
+    /// or resolution for PENDING.
     using RequestHandler = ::pico_http::RequestHandler;
 
-    /// Keep-alive policy (RR-5, NR-2). idle_timeout_seconds is the TR-3
-    /// idle window between requests on a persistent connection; the request
-    /// cap bounds how long one client can hold a slot.
+    /// Persistence policy and the idle window between requests (RR-5, NR-2,
+    /// TR-3).
     struct KeepAliveConfig {
         /// Default idle window between requests, in seconds (TR-3).
         static constexpr std::uint32_t DEFAULT_IDLE_TIMEOUT_SECONDS = 15;
@@ -158,9 +96,8 @@ class HttpService : private ITransportEvents {
         std::uint32_t max_requests_per_connection = DEFAULT_MAX_REQUESTS;
     };
 
-    /// Per-phase request timeouts (TR-1, TR-2, TR-4). TR-3 (idle) comes from
-    /// KeepAliveConfig::idle_timeout_seconds; TR-5 (drain linger) is enforced
-    /// by the transport.
+    /// Request-phase deadlines. Idle timing comes from KeepAliveConfig; the
+    /// transport enforces drain linger (TR-1, TR-2, TR-4, TR-3, TR-5).
     struct TimeoutConfig {
         /// Default header_ms.
         static constexpr std::uint32_t DEFAULT_HEADER_MS = 5000;
@@ -170,19 +107,16 @@ class HttpService : private ITransportEvents {
         static constexpr std::uint32_t DEFAULT_WRITE_MS = 10000;
         /// Default handler_ms.
         static constexpr std::uint32_t DEFAULT_HANDLER_MS = 10000;
-        /// TR-1: accept to head complete. Bounds a client that opens a
-        /// connection and sends a partial request line.
+        /// Accept-to-head deadline in milliseconds, bounding partial requests
+        /// (TR-1).
         std::uint32_t header_ms = DEFAULT_HEADER_MS;
-        /// TR-2: time without body progress.
+        /// Time without body progress, in milliseconds (TR-2).
         std::uint32_t body_ms = DEFAULT_BODY_MS;
-        /// TR-4: time without acknowledgement progress while sending.
+        /// Time without ACK progress while sending, in milliseconds (TR-4).
         std::uint32_t write_ms = DEFAULT_WRITE_MS;
-        // TR-6: handler returned PENDING and has not called respond(). Matches
-        // the write-stall bound rather than the shorter header one: a deferring
-        // handler is legitimately waiting on something slow, so this must catch
-        // a hung handler without tearing down a merely slow one.
-        /// TR-6: time a handler may stay PENDING before the connection is
-        /// torn down.
+        /// Time in milliseconds a handler may stay PENDING before teardown.
+        /// The deadline must catch a hung handler without closing a merely
+        /// slow one (TR-6).
         std::uint32_t handler_ms = DEFAULT_HANDLER_MS;
     };
 
@@ -190,7 +124,7 @@ class HttpService : private ITransportEvents {
     struct Statistics {
         /// Connections accepted.
         std::uint32_t accepts = 0;
-        /// Connections refused because no slot was free (RR-3).
+        /// TCP connections rejected because no slot was free (RR-3).
         std::uint32_t refusals_slot_full = 0;
         /// Requests answered, whatever the status.
         std::uint32_t requests_completed = 0;
@@ -214,9 +148,7 @@ class HttpService : private ITransportEvents {
         std::uint32_t disconnect_peer_closed = 0;
         /// Connections ended by a peer RST.
         std::uint32_t disconnect_peer_reset = 0;
-        /// Connections the local stack aborted: lwIP's error callback with an
-        /// error other than a reset. A fault of this side, never folded into
-        /// the peer's count (OR-1).
+        /// Local stack aborts other than peer resets (OR-1).
         std::uint32_t disconnect_aborted = 0;
         /// Connections ended by a timeout, the total across the kinds below.
         std::uint32_t disconnect_timeout = 0;
@@ -230,46 +162,32 @@ class HttpService : private ITransportEvents {
         std::uint32_t disconnect_timeout_write = 0;
         /// Timeouts on the close-drain linger (TR-5).
         std::uint32_t disconnect_timeout_drain = 0;
-        /// TR-6: a handler deferred and never resolved.
+        /// Unresolved deferred handlers (TR-6).
         std::uint32_t disconnect_timeout_handler = 0;
         /// Connections ended because the server itself stopped.
         std::uint32_t disconnect_server_closed = 0;
         /// Times a response could not be written in full and was parked to
         /// resume on a writable event. Expected under load, not a fault.
         std::uint32_t backpressure_events = 0;
-        /// Times the receive window was held closed against the peer because
-        /// bytes were still buffered. Routine under load — it is what AR-6
-        /// flow control looks like from outside, not a fault.
+        /// Times buffered bytes held the receive window closed (AR-6).
         std::uint32_t rx_window_throttle_events = 0;
-        /// Times delivered bytes did not fit the RX assembly buffer and were
-        /// discarded. Structurally unreachable while RX_CAPACITY covers the
-        /// advertised window (the static_assert below), and a desynced TCP
-        /// stream if it ever happens. Counted apart from the throttle events
-        /// above because a fault buried in a counter that increments in normal
-        /// operation cannot be seen (CXX-07.6).
+        /// Delivered bytes discarded because the RX buffer was full. Any
+        /// increment indicates a fault.
         std::uint32_t rx_overflow_drops = 0;
         /// Handlers that returned Disposition::PENDING (AR-9). Routine — this
         /// is the feature working, not a fault.
         std::uint32_t pending_dispatches = 0;
-        /// Handlers that returned PENDING while the BR-12 deferral cap was
-        /// already reached, and were answered 503. A capacity fault, counted
-        /// apart from pending_dispatches so it is not buried in a number that
-        /// grows in normal operation (CXX-07.6) — the same reason the two RX
-        /// counters are separate. Only a *deferral* is ever counted here: a
-        /// handler that answers inline is not subject to the cap.
+        /// Deferrals answered 503 because the cap was reached. Inline
+        /// handlers are exempt (BR-12).
         std::uint32_t deferrals_refused = 0;
-        /// Responses answered with the fixed 500 because the handler's head
-        /// overflowed HEAD_CAPACITY (BR-13) or its copied body exceeded
-        /// MAX_BUFFERED_BODY (BR-14): a handler fault. Such a response also
-        /// counts in requests_completed; this counter is what tells it apart
-        /// (OR-1).
+        /// Fixed 500 responses for oversized heads or copied bodies, also
+        /// included in requests_completed (BR-13, BR-14, OR-1).
         std::uint32_t responses_refused = 0;
         /// Request bytes received across all connections.
         std::uint64_t bytes_in = 0;
         /// Response bytes written across all connections.
         std::uint64_t bytes_out = 0;
-        /// Running peak of concurrently occupied slots, against
-        /// MAX_CONNECTIONS. Compare with active_connections() for the live
+        /// Peak occupied slots. active_connections() reports the current
         /// count.
         std::uint32_t slot_high_watermark = 0;
         /// Running peak of concurrently deferred requests, against MAX_PENDING.
@@ -277,14 +195,12 @@ class HttpService : private ITransportEvents {
     };
 
     /// Connection slots this service holds, from the active profile. Fixed at
-    /// compile time; a connection arriving with none free is refused (RR-3).
+    /// compile time. Excess connections receive TCP RST (RR-3).
     static constexpr std::size_t MAX_CONNECTIONS = Profile::MAX_CONNECTIONS;
     static_assert(MAX_CONNECTIONS == ::pico_http::MAX_CONNECTIONS,
                   "profile slot count must match the transport's slot count");
 
-    /// BR-12: concurrent deferred requests (AR-9). Also the response-pool size,
-    /// which needs only one entry per live dispatch turn — so this is margin
-    /// there and the binding limit on deferrals.
+    /// Deferred-request cap and response-pool capacity (BR-12, AR-9).
     static constexpr std::size_t MAX_PENDING = Profile::MAX_PENDING_RESPONSES;
     static_assert(MAX_PENDING >= 1,
                   "the deferral cap must be at least one: a zero cap answers "
@@ -294,28 +210,20 @@ class HttpService : private ITransportEvents {
     static_assert(MAX_PENDING <= MAX_CONNECTIONS,
                   "the deferral cap cannot exceed the slot count");
 
-    // The line cap and the storage caps must agree about what a header can be.
-    // A line cap below name + ':' + OWS + value rejects at the line before the
-    // value cap is reachable, so /limits would advertise a value cap the
-    // parser never enforces and the shortfall would be per-slot storage no
-    // request could fill. Asserted here rather than in HttpParser, which tests
-    // deliberately instantiate with tiny limits to drive the 431 boundary.
+    // The line and storage caps must agree so every advertised header value
+    // fits. Parser tests use smaller line limits to exercise 431.
     static_assert(Profile::Limits::MAX_HEADER_LINE >=
                       HTTPHeaders::MAX_HEADER_NAME +
                           HTTPHeaders::MAX_HEADER_VALUE + HEADER_LINE_SYNTAX,
                   "the profile's MAX_HEADER_LINE must admit a full-length "
                   "header name and a full-length header value on one line");
 
-    /// How this translation unit was sized. Evaluated at the *caller's* compile
-    /// time, so it reports the caller's macro values, not the library's. A
-    /// function rather than a constant because it measures Conn, which is
-    /// declared further down: a member function body is compiled as if after
-    /// the class is complete, an in-class initialiser is not.
+    /// Reports sizes from the caller translation unit. A function body can
+    /// measure Conn after the class is complete.
     static constexpr ProfileBinding caller_binding() noexcept;
 
-    /// `binding` defaults to the caller's view of the profile and is compared
-    /// against the library's; a mismatch aborts rather than proceeding with two
-    /// incompatible layouts. Do not pass it explicitly.
+    /// Abort on incompatible caller and library layouts. Do not pass binding
+    /// explicitly.
     explicit HttpService(std::unique_ptr<ITcpTransport> transport,
                          ProfileBinding binding = caller_binding());
     ~HttpService() override;
@@ -325,22 +233,19 @@ class HttpService : private ITransportEvents {
     HttpService(HttpService&&) = delete;
     HttpService& operator=(HttpService&&) = delete;
 
-    /// Bind and start serving. Returns false if the port could not be bound.
-    /// Everything before start() — construction, route registration, config —
-    /// is the one-time init budget (AR-1) and may allocate; after start() the
-    /// service is driven entirely by transport callbacks.
+    /// Start serving, or return false if binding fails (AR-1).
+    /// Construction, registration and configuration before start() may
+    /// allocate. Transport callbacks drive the service afterwards.
     bool start(std::uint16_t port);
 
     /// Close every live connection (clients see SERVER_CLOSED teardown) and
     /// stop listening. The destructor calls this.
     void stop();
 
-    /// Register a handler. `uri_pattern` is an exact match, or a prefix match
-    /// when it ends in `*` (e.g. "/files/*"). Returns false, registering
-    /// nothing, if the method or pattern exceeds RouteTable's fixed capacity
-    /// (15 / 127 chars) — a truncated pattern would never match. Registration
-    /// is init-only: call before start() — it allocates (init budget) and is
-    /// not synchronized with in-flight dispatch.
+    /// Register an exact or trailing-* prefix route. Excess method or pattern
+    /// length returns false without registration.
+    /// Call before start(): registration allocates and is not synchronised
+    /// with dispatch.
     [[nodiscard]] bool add_route(std::string_view method,
                                  std::string_view uri_pattern,
                                  RequestHandler handler);
@@ -382,35 +287,13 @@ class HttpService : private ITransportEvents {
     /// statistics().slot_high_watermark, which is the running peak).
     [[nodiscard]] std::size_t active_connections() const noexcept;
 
-    /// Resolve a request whose handler returned Disposition::PENDING (AR-9).
-    ///
-    /// Records `fill`/`ctx` against the request and rings the transport's
-    /// doorbell; the response is built and sent on the transport's next turn,
-    /// when the service invokes `fill(ctx, response)` against a pool entry —
-    /// and only if the request is still live. `fill` therefore either runs
-    /// against a valid response for the right request, or does not run at all.
-    ///
-    /// **This call performs no send.** It allocates nothing, makes no lwIP
-    /// call, and holds the transport's completion lock only for the stores that
-    /// publish the record — so it is safe from any context, including core 1
-    /// and an ISR. `ctx` must outlive the call to `fill`, which has not
-    /// happened when this returns.
-    ///
-    /// Inert, returning false, when `id` does not name a request still waiting
-    /// on a completion: the connection timed out (TR-6), was reset, was
-    /// reclaimed by stop(), has moved on to a later request, or has already had
-    /// a completion recorded. That is the normal race rather than an error
-    /// (AR-4). A false return means `fill` will never run.
-    ///
-    /// A true return means the completion was *recorded*, not that it will be
-    /// delivered: delivery needs the transport to signal its own context
-    /// (ITcpTransport::signal_completion) or to drive on_poll() itself. On a
-    /// transport that does neither, a PENDING handler's response is never
-    /// written and the connection hangs until TR-6.
-    ///
-    /// Calling this from inside the handler, before returning PENDING, is
-    /// supported: the request is completed as the handler returns rather than
-    /// being parked.
+    /// Record a completion without allocation or sending, from any context
+    /// (AR-9).
+    /// ctx must outlive fill(). A stale or duplicate id returns false without
+    /// running fill (TR-6, AR-4).
+    /// A true return records the completion; delivery needs
+    /// signal_completion() or on_poll(). Inline completion before returning
+    /// PENDING is supported.
     bool respond(RequestId id, ResponseFiller fill, void* ctx);
 
     /// Live count of connections parked awaiting respond() (BR-12), against
@@ -420,25 +303,15 @@ class HttpService : private ITransportEvents {
     }
 
    private:
-    // Serialized response head (status line + headers). Fixed so serialization
-    // never touches the heap (AR-1). 1 KiB comfortably holds this server's
-    // responses (status line + a handful of headers + framing); a handler
-    // emitting a header block larger than this is rejected rather than sent
-    // truncated (see begin_response). 1 KiB × 8 slots = 8 KiB static.
+    // Response-head capacity in bytes. An oversized head receives a fixed 500
+    // (AR-1).
     static constexpr std::size_t HEAD_CAPACITY = Profile::HEAD_CAPACITY;
     // Scratch used to pull bytes from a generator body one chunk at a time.
     static constexpr std::size_t GENERATOR_CHUNK = Profile::GENERATOR_CHUNK;
 
-    // RX assembly buffer capacity. This MUST be >= the transport's advertised
-    // receive window (lwIP TCP_WND, currently 2×MSS): received bytes are only
-    // acknowledged to the transport (consume() -> tcp_recved, reopening the
-    // window) once the parser has taken them, so unconsumed bytes hold the
-    // window closed rather than being dropped (AR-6). If the buffer were
-    // smaller than a full window, lwIP could deliver more than fits in one
-    // burst and the excess — already ACKed at the TCP layer and freed with the
-    // pbuf — would be lost, desyncing the stream. Holding delivered bytes here
-    // also lets the service process pipelined requests serially while an
-    // earlier response is still draining under backpressure.
+    // RX_CAPACITY MUST cover the advertised receive window: lwIP has already
+    // ACKed delivered bytes, so an overflow would be lost and desynchronise
+    // the stream. Only parsed bytes return credit (AR-6).
     static constexpr std::size_t RX_CAPACITY = Profile::RX_CAPACITY;
     static_assert(
         RX_CAPACITY >= ADVERTISED_RX_WINDOW,
@@ -463,46 +336,32 @@ class HttpService : private ITransportEvents {
 
         Phase phase = Phase::RECV_HEAD;
 
-        // The response in flight: serialized head, body source, cursors and
+        // The response in flight: serialised head, body source, cursors and
         // framing state (heap-free streaming, AR-5).
         detail::ResponseWriter<HEAD_CAPACITY, GENERATOR_CHUNK> writer{};
 
         std::uint32_t requests_served = 0;
         bool active = false;
         bool closing = false;  // finish draining the response, then close
-        // A handler returned PENDING and has not resolved yet (AR-9). While
-        // set, the parser is NOT reset — the request views handed to that
-        // handler point into it — and no further pipelined request is consumed,
-        // so buffered bytes hold the receive window closed (AR-6).
+        // While deferred, preserve parser storage for request views and stop
+        // consuming pipelined requests (AR-9, AR-6).
         bool pending = false;
 
-        // --- Deferred-completion record (AR-9) ------------------------------
-        //
-        // Written by respond(), which may run on core 1 or in an ISR, and read
-        // and cleared by poll_completions() on the transport's context. Every
-        // access to the three fields below is bracketed by the transport's
-        // completion lock (AR-3) so a half-published record is never observed.
+        // respond() can publish from another core or an ISR. The completion
+        // lock brackets every access to the record (AR-9, AR-3).
 
-        // Names the request currently dispatching or parked, so a completion
-        // that arrives for an earlier request on this same connection is
-        // rejected instead of resolving the current one.
+        // The dispatching or parked request. A sequence mismatch rejects an
+        // earlier completion.
         RequestId pending_request{};
         // The filler respond() recorded, invoked on the async-context turn.
         ResponseFiller pending_fill = nullptr;
         void* pending_ctx = nullptr;
-        // respond() has published a completion that poll_completions() has not
-        // yet taken. Separate from `pending`: a completion can be recorded
-        // before the handler has even returned (a handler that resolves
-        // inline), at which point the request is not parked at all.
+        // Published completion not yet taken. Publication can precede the
+        // handler returning PENDING.
         bool completion_ready = false;
 
-        // Return the slot to its FREE state without materialising a ~12 KB
-        // temporary on the stack (the parser alone is several KB). Only the
-        // length/cursor fields are reset — the large rx and head arrays keep
-        // their storage — and a copied body is freed, so an idle slot holds no
-        // copied-body heap (AR-1). Called on connect,
-        // disconnect, and server stop, all of which run inside a transport
-        // callback.
+        // Reset cursors and release copied storage without a large stack
+        // temporary. Called on connect, disconnect and stop (AR-1).
         void reset() noexcept {
             parser.reset();
             rx_len = 0;
@@ -528,14 +387,13 @@ class HttpService : private ITransportEvents {
 
     void on_refused() override { ++stats_.refusals_slot_full; }
 
-    /// The transport reached a turn on which recorded completions can be sent
-    /// (AR-9). This is where a deferred response is actually built and queued —
-    /// respond() only published the record.
+    /// Builds and queues recorded completions on the transport context
+    /// (AR-9).
     void on_poll() override { poll_completions(); }
 
     void poll_completions();
     // Drop whatever completion handle a slot carries, so nothing can resolve a
-    // request that is already answered or refused.
+    // request that is already answered or rejected with an error status.
     void clear_completion_record(Conn& conn);
     // Build and send one recorded completion. Runs on the transport's context.
     void complete_deferred(Conn& conn, RequestId id, ResponseFiller fill,
@@ -543,32 +401,26 @@ class HttpService : private ITransportEvents {
 
     Conn* conn_for(ConnectionId id);
     void process(Conn& conn, ConnectionId id);
-    // The request as a handler sees it, over the connection's parser storage.
-    // Rebuilt rather than stored across a deferral: the parser still holds the
-    // request (a pending slot is never reset), so the view is reconstructible
-    // and there is no second copy to keep in step.
+    // Request views are rebuilt over parser storage retained during a
+    // deferral.
     [[nodiscard]] static HTTPRequestView request_view(const Conn& conn,
                                                       RequestId id);
     // Route and run the handler, returning what it did with the response.
     [[nodiscard]] Disposition invoke_handler(const HTTPRequestView& request,
                                              HTTPResponse& response);
     void dispatch_request(Conn& conn, ConnectionId id);
-    // Frame and queue a filled response, then release its pool entry. Shared by
-    // the synchronous path and respond(), so the framing decisions (NR-2, NR-6)
-    // cannot diverge between them.
+    // Share framing and pool release between inline and deferred responses
+    // (NR-2, NR-6).
     void complete_request(Conn& conn, RequestId id, HTTPResponse& response);
-    // Refuse a deferral past the BR-12 cap. Separate from serialize_error: an
-    // overload is not a malformed request, so it carries no parse-error class
-    // and does not bump parse_errors.
+    // Answer an excess deferral without incrementing parse_errors (BR-12).
     void serialize_service_unavailable(Conn& conn);
     void begin_response(Conn& conn, const HTTPRequestView& request,
                         HTTPResponse& response, bool close_connection);
     // Answer with the fixed 500 and close, freeing the handler's copied body:
     // the response that cannot be sent as built (BR-13, BR-14).
     void begin_internal_error(Conn& conn, HTTPResponse& response);
-    // Serializes the status line and header section into `head`, applying the
-    // framing already chosen for this response. Returns the byte count, or
-    // nullopt when the head does not fit HEAD_CAPACITY.
+    // Serialise the head. Return its byte count, or nullopt if it exceeds
+    // HEAD_CAPACITY.
     [[nodiscard]] std::optional<std::size_t> serialize_head(
         std::span<std::uint8_t> head, const Conn& conn,
         std::string_view version, const HTTPResponse& response,
@@ -580,33 +432,21 @@ class HttpService : private ITransportEvents {
                                          const Conn& conn) const;
     void apply_keep_alive_config();
 
-    // Arm the transport timeout matching `phase` and record it on the conn.
-    // Called only on genuine phase transitions so a fixed-window timeout (TR-1)
-    // is not reset byte-by-byte, which would defeat slowloris defense.
+    // Arm only on a phase transition so header drips cannot reset the fixed
+    // window (TR-1).
     void set_phase(Conn& conn, ConnectionId id, Phase phase);
-    // After parsing/pumping, arm the deadline for whatever comes next: the body
-    // window while reading a body, a fresh header window when a new request's
-    // head is arriving (armed only on entry so slowloris drip cannot keep
-    // resetting it), or the keep-alive idle window when nothing is pending.
+    // Choose the body, new-head or idle deadline after parsing and sending.
     void finalize_phase(Conn& conn, ConnectionId id);
-    // Emit the interim "100 Continue" once, if the request asked for it (NR-5).
-    // The writer owns delivering it, and any not-yet-accepted remainder, before
-    // the response head so the two cannot interleave on the wire.
+    // Queue the interim 100 before the final head, including across partial
+    // sends (NR-5).
     void maybe_send_continue(Conn& conn, ConnectionId id);
 
     std::unique_ptr<ITcpTransport> transport_;
-    // Deferred responses in flight (AR-9, BR-12). A service member rather than
-    // per-slot storage: sized by how many handlers defer at once, not by how
-    // many connections exist.
-    // Response objects lent to a handler for the duration of one dispatch or
-    // one deferred completion, never across a deferral (AR-9). Sized by how
-    // many such turns can be live at once — one — with MAX_PENDING's margin so
-    // a future re-entrant path cannot silently start refusing requests.
+    // Response entries are held only during dispatch or completion, with
+    // capacity beyond one live turn (AR-9, BR-12).
     detail::PendingPool<MAX_PENDING> pending_{};
-    // Connections currently parked awaiting respond(). This, not the pool, is
-    // what BR-12 caps: a pool entry is held only for the length of a turn, so
-    // sizing the cap on it would let slow handlers refuse ordinary synchronous
-    // traffic on other connections.
+    // Parked requests, counted independently of response entries held during
+    // a call (BR-12).
     std::size_t deferred_count_ = 0;
     RouteTable routes_{};
     RequestHandler default_handler_;
@@ -617,9 +457,8 @@ class HttpService : private ITransportEvents {
     std::array<Conn, MAX_CONNECTIONS> conns_{};
 };
 
-// Out of line: Conn must be complete before sizeof/alignof can be taken, and a
-// default argument is only evaluated at the call site, so the constructor's
-// `binding = caller_binding()` still resolves to the caller's values.
+// Conn must be complete for sizeof and alignof. The default argument still
+// evaluates in the caller translation unit.
 constexpr ProfileBinding HttpService::caller_binding() noexcept {
     return ProfileBinding{
         .max_connections = Profile::MAX_CONNECTIONS,

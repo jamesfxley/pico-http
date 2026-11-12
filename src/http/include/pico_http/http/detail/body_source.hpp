@@ -10,11 +10,7 @@
 #include "pico_http/http/message.hpp"
 
 /// \file body_source.hpp
-/// The body a response is currently emitting, in whichever of the three modes
-/// the handler chose. Gathering the mode, its storage and its declared length
-/// into one type keeps the three representations (the handler's HTTPResponse,
-/// the connection's in-flight copy, and the transfer switch that moved between
-/// them) from having to be edited in step.
+/// Storage and length for the response body in flight.
 
 namespace pico_http::detail {
 
@@ -23,11 +19,7 @@ class BodySource {
     using Mode = HTTPResponse::BodyMode;
     using Generator = HTTPResponse::BodyGenerator;
 
-    /// Take the body over from a handler's response. BUFFERED swaps the vector
-    /// rather than copying elements, so the handler's bytes are moved and the
-    /// response is left with the empty buffer reset() leaves here;
-    /// STATIC_VIEW and GENERATOR retain the caller's source, so no body copy
-    /// happens at all (AR-2).
+    /// Adopt the body without copying its bytes (AR-2).
     void adopt(HTTPResponse& response) noexcept {
         reset();
         mode_ = response.body_mode;
@@ -50,9 +42,7 @@ class BodySource {
         }
     }
 
-    /// Drop back to an empty buffered body, freeing any copied one. set_body
-    /// builds a fresh exact-sized vector for every copied response, so capacity
-    /// kept here would never be reused, only held (AR-1).
+    /// Reset to an empty buffered body and release copied storage (AR-1).
     void reset() noexcept {
         mode_ = Mode::BUFFERED;
         std::vector<std::uint8_t>().swap(owned_);
@@ -94,10 +84,7 @@ class BodySource {
         }
     }
 
-    /// Pull body bytes beginning at `offset`. The generator is a pure function
-    /// of the offset — the writer owns the position — so a partial send simply
-    /// resumes from where the transport stopped. Returns bytes written, never
-    /// more than `out` holds.
+    /// Generate bytes at offset, returning at most out.size() bytes.
     [[nodiscard]] std::size_t generate(std::size_t offset,
                                        std::span<std::uint8_t> out) const {
         if (generator_ == nullptr) {

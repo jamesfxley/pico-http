@@ -15,8 +15,6 @@ target_include_directories(pico_http_util INTERFACE
 
 target_compile_features(pico_http_util INTERFACE cxx_std_20)
 
-# PUBLIC: tx_ring.hpp takes its wrap arithmetic from pico_util::ring_index, and
-# the http module's headers carry pico_util::FixedString and as_bytes, so those
-# headers reach a consumer through this library's own. Every module that needs
-# them links pico_http::util already.
+# Public headers use pico_util::ring_index, FixedString and as_bytes, so
+# consumers inherit pico_util.
 target_link_libraries(pico_http_util INTERFACE pico_util::core)

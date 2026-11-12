@@ -1,8 +1,5 @@
-# The transport-independent core: the ITcpTransport seam, connection identity,
-# the slot table and the timeout scheduler. Host-safe and header-only, so the
-# target type no longer depends on whether this is a firmware build and no
-# scope variable has to be threaded through the calls below. The concrete
-# lwIP-backed transport is a separate firmware-only target (lwip/).
+# The host-safe transport core is header-only. The firmware adapter is a
+# separate target.
 add_library(pico_http_tcp INTERFACE)
 add_library(pico_http::tcp ALIAS pico_http_tcp)
 
@@ -12,8 +9,7 @@ target_sources(pico_http_tcp INTERFACE
     FILES
         include/pico_http/tcp/tcp_transport.hpp
         include/pico_http/tcp/connection_id.hpp
-        # The documented porting seam (docs/usage-guide.md): a downstream
-        # transport derives from TransportBase, so it ships with the package.
+        # TransportBase is installed for downstream transport implementations.
         include/pico_http/tcp/transport_base.hpp
         include/pico_http/tcp/detail/slot_table.hpp
         include/pico_http/tcp/detail/timeout_scheduler.hpp
@@ -36,5 +32,4 @@ if(PICO_HTTP_BUILD_FIRMWARE)
     add_subdirectory(lwip)
 endif()
 
-# Host-only unit tests for the transport-independent core (slot table,
-# generation handles, timeout scheduler). The lwIP glue is validated on-device.
+# Host tests cover the portable core; device tests cover the lwIP adapter.

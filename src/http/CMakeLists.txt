@@ -24,11 +24,8 @@ target_sources(pico_http_http PUBLIC
     FILES ${PICO_HTTP_PUBLIC_HEADERS}
 )
 
-# PRIVATE: build-time facts for the static_assert in http_service.cpp, not part
-# of the interface. PUBLIC would propagate this build's version into every
-# installed consumer's compile line. The umbrella header belongs to
-# pico_http::core, which links this module rather than the other way round, so
-# it is reached by a private include directory and not a link dependency.
+# Version facts and the umbrella include path are private. The core target
+# depends on this module.
 house_cxx_version_definitions(pico_http_http pico_http PRIVATE)
 
 target_include_directories(pico_http_http PRIVATE
@@ -54,23 +51,17 @@ target_link_libraries(pico_http_http PRIVATE
 )
 
 if(PICO_HTTP_BUILD_FIRMWARE)
-    # make_http_service() constructs the concrete lwIP transport, so the
-    # firmware build of this target — and only that build — depends on it.
+    # Only firmware defines the factory that constructs LwipTcpTransport.
     target_sources(pico_http_http PRIVATE
         default_service.cpp
     )
-    # Warnings are errors for the code this project owns. Per source rather than
-    # on the target: the SDK compiles its own sources into this one, and
-    # pico_http_strict therefore carries WERROR OFF in a firmware build.
+    # Apply -Werror per owned source so SDK sources keep their diagnostics.
     house_cxx_werror_sources(http_service.cpp default_service.cpp)
     target_link_libraries(pico_http_http PUBLIC
         pico_http::tcp_lwip
     )
-    # Through pico_family_sdk_link_libraries: a PRIVATE link to an SDK target
-    # still appears in this target's link interface under $<LINK_ONLY:...>,
-    # which is enough for install(EXPORT) to refuse it. pico-tooling's
-    # exportability requirement, cited by description because AR is this
-    # repository's own prefix (EN-02.8).
+    # The family helper makes SDK links exportable; a private direct link
+    # would still expose unexported targets through LINK_ONLY.
     pico_family_sdk_link_libraries(pico_http_http
         PRIVATE
             pico_stdlib

@@ -1,15 +1,11 @@
-# The concrete lwIP-backed transport. Firmware-only: it is the one component
-# that touches the lwIP raw API and the cyw43 async context, which is why it is
-# a target of its own rather than a conditional arm of pico_http_tcp.
+# Firmware adapter for raw lwIP and the cyw43 async context.
 add_library(pico_http_tcp_lwip STATIC
     lwip_tcp_transport.cpp
 )
 add_library(pico_http::tcp_lwip ALIAS pico_http_tcp_lwip)
 
-# Warnings are errors for the code this project owns. Per source rather than on
-# the target: the SDK and lwIP compile their own sources into this one, and
-# pico_http_strict therefore carries WERROR OFF in a firmware build, which is
-# the only build this target has.
+# Apply -Werror per owned source so SDK and lwIP sources keep their
+# diagnostics.
 house_cxx_werror_sources(lwip_tcp_transport.cpp)
 
 target_sources(pico_http_tcp_lwip PUBLIC
@@ -31,29 +27,16 @@ target_link_libraries(pico_http_tcp_lwip PUBLIC
     pico_http::lwipopts_assertions
 )
 
-# The application's lwipopts.h, named once for the whole family by
-# PICO_LWIPOPTS_TARGET. That is pico-tooling's requirement, cited by description
-# because AR is this repository's own prefix (EN-02.8).
-#
-# PUBLIC, and that is not a weakening: the SDK's lwIP INTERFACE libraries
-# propagate from here to whichever target links this one -- pico_http_http in a
-# firmware build -- and it is that target which compiles the lwIP sources. The
-# configuration has to travel the same edge they do or those sources compile
-# without one. What changed is ownership, not visibility: the target named here
-# is the application's, and this library ships none.
+# Propagate application lwIP options with the SDK INTERFACE libraries so each
+# target compiling lwIP sources receives the configuration.
 target_link_libraries(pico_http_tcp_lwip PUBLIC ${PICO_LWIPOPTS_TARGET})
 
 target_link_libraries(pico_http_tcp_lwip PRIVATE
     pico_http_strict
 )
 
-# The SDK libraries go through this rather than target_link_libraries, because a
-# target linking them cannot be exported: no SDK target is in any export set,
-# and both export(TARGETS) and install(EXPORT) refuse a target whose link
-# interface names one. They are wrapped in $<BUILD_LOCAL_INTERFACE:> and
-# re-applied by the installed config file, once the consumer's own
-# pico_sdk_init() has created them. pico-tooling's exportability requirement,
-# cited by description because AR is this repository's own prefix (EN-02.8).
+# The family helper hides SDK targets during export and restores them after
+# the consumer calls pico_sdk_init().
 pico_family_sdk_link_libraries(pico_http_tcp_lwip
     PUBLIC
         pico_lwip_nosys

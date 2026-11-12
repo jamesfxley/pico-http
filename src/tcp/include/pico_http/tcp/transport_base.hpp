@@ -13,47 +13,23 @@
 #include "pico_http/tcp/tcp_transport.hpp"
 
 /// \file transport_base.hpp
-/// Slot, timeout and teardown machinery shared by every ITcpTransport
-/// implementation. Owns the generation-tagged slot table (AR-4), the per-slot
-/// timeout scheduler (AR-7), the event callbacks, and the drain-close lifecycle
-/// (TR-5), so the firmware and host transports cannot diverge on any of them.
-///
-/// Disconnect notifications are deferred: a teardown that happens while a
-/// transport callback is on the stack releases its slot immediately — the id
-/// goes stale at once, so every later operation naming it is inert — but the
-/// disconnect callback does not run until the outermost callback scope unwinds.
-/// Without this, a service that calls close_client() mid-callback is re-entered
-/// through on_disconnect while still holding a reference to the per-connection
-/// state that the notification resets. Deferring makes that reference stable
-/// for the duration of a callback by construction rather than by convention.
-///
-/// A derived transport supplies the slot payload and three hooks; everything
-/// else here is shared. Pure C++ (no lwIP): host-testable.
+/// Shared slots, deadlines and drain-close lifecycle (AR-4, AR-7, TR-5).
+/// Teardown invalidates the id immediately. Disconnect notification waits
+/// until the outermost callback returns, preserving service state while
+/// callbacks hold references.
 
 namespace pico_http::tcp {
 
-/// Everything an ITcpTransport needs that is not stack-specific: a fixed slot
-/// table, connection-id generation, the timeout scheduler, and the deferred
-/// disconnect delivery that makes an id stay valid for the duration of a
-/// callback.
-///
-/// A derived transport supplies `Slot` — its own per-connection payload — and
-/// the three hooks the shared code cannot provide. `Capacity` fixes the slot
-/// count at compile time; there is no growth path, by design (AR-1).
-///
-/// Pure C++ with no lwIP dependency, which is what lets the whole HTTP layer be
-/// host-tested against FakeTcpTransport.
+/// Fixed-capacity transport state and deferred disconnect delivery (AR-1).
+/// Derived transports supply a slot payload and four stack-specific hooks.
 template <typename Slot, std::size_t Capacity>
 class TransportBase : public ITcpTransport {
    public:
     /// Connection slots this transport can hold open at once.
     static constexpr std::size_t CAPACITY = Capacity;
 
-    // --- ITcpTransport: the parts that are identical in every transport -----
-    //
-    // These forward to the *_impl bodies below. A transport whose entry points
-    // need external synchronisation (the lwIP one takes the stack lock)
-    // overrides the public method, acquires what it needs, and delegates.
+    // A transport can override an entry point to acquire its stack lock
+    // before delegating to the shared implementation.
 
     /// Close a connection and release its slot. Delegates to close_client_impl.
     void close_client(ConnectionId client) override {
@@ -86,11 +62,8 @@ class TransportBase : public ITcpTransport {
     /// The fixed slot table this transport keeps connections in.
     using SlotTableType = detail::SlotTable<Slot, Capacity>;
 
-    /// RAII marker for "a transport callback is on the stack". Disconnect
-    /// notifications raised while any scope is live are queued and delivered
-    /// when the outermost one unwinds. Every entry point that can reach
-    /// application code — an lwIP raw callback, a timeout sweep, a test-side
-    /// wire event — opens one.
+    /// Disconnect notifications wait until the outermost callback scope
+    /// returns. Every entry point reaching application code opens a scope.
     class CallbackScope {
        public:
         /// Open a scope on `owner`. Nesting is expected and counted; only the
@@ -116,11 +89,7 @@ class TransportBase : public ITcpTransport {
 
     // --- Hooks a derived transport must supply ------------------------------
 
-    // The four hooks below are pure virtual, so there is nothing for this
-    // template to instantiate and no divergence between compilers to guard
-    // against; the check cannot tell a pure virtual from a defaulted one.
-    // Both concrete transports -- LwipTcpTransport and FakeTcpTransport --
-    // are compiled and exercised, on firmware and host respectively.
+    // portability-template-virtual-member-function: the hooks are pure virtual.
     // NOLINTBEGIN(portability-template-virtual-member-function)
 
     /// Milliseconds from the transport's clock (real or simulated).
@@ -133,21 +102,18 @@ class TransportBase : public ITcpTransport {
     /// Mark the slot as closing; the close completes once slot_drained().
     virtual void set_close_pending(Slot& slot) = 0;
 
-    /// Release transport-owned resources for a slot being torn down (pcbs,
-    /// buffers, simulation state). Must not invoke application callbacks — the
-    /// base delivers the disconnect notification itself.
+    /// Release stack resources. Must not invoke application callbacks; the
+    /// base reports the disconnect.
     virtual void release_slot_resources(ConnectionId client, Slot& slot,
                                         DisconnectReason reason) = 0;
 
-    // Closes the region opened above; the pure-virtual reason is there.
+    // portability-template-virtual-member-function: scope ends here.
     // NOLINTEND(portability-template-virtual-member-function)
 
     // --- Shared bodies for the ITcpTransport methods above -------------------
 
-    /// Shared body for close_client(). Marks the slot closing, bounds the
-    /// linger with a DRAIN timeout so an unacknowledged queue cannot hold the
-    /// slot forever (TR-5), and completes at once if nothing is outstanding. A
-    /// stale id is a no-op, not an error (AR-4).
+    /// Drain before closing, bounded by the linger deadline. A stale id is
+    /// inert (TR-5, AR-4).
     void close_client_impl(ConnectionId client) {
         Slot* slot = clients_.get(client);
         if (slot == nullptr) {
@@ -160,9 +126,8 @@ class TransportBase : public ITcpTransport {
         finish_close_if_drained(client, *slot);
     }
 
-    /// Shared body for arm_timeout(). A stale id is a no-op, and TimeoutKind::
-    /// DRAIN is refused: the linger is transport-internal and only
-    /// close_client_impl() may arm it.
+    /// Replaces the deadline for a live id. Only close_client_impl() may arm
+    /// DRAIN.
     void arm_timeout_impl(ConnectionId client, TimeoutKind kind,
                           std::uint32_t ms_from_now) {
         if (clients_.get(client) == nullptr) {
@@ -185,10 +150,8 @@ class TransportBase : public ITcpTransport {
 
     // --- Shared teardown ----------------------------------------------------
 
-    /// Tear a connection down: release its resources and its slot (making the
-    /// id stale immediately), then report the disconnect — deferred if a
-    /// callback is on the stack. Idempotent: tearing down a stale id is a
-    /// no-op.
+    /// Release resources and invalidate the id before reporting disconnect.
+    /// Notification waits for callback return; stale teardown is inert.
     void teardown(ConnectionId client, DisconnectReason reason) {
         Slot* slot = clients_.get(client);
         if (slot == nullptr) {
@@ -274,28 +237,19 @@ class TransportBase : public ITcpTransport {
         }
     }
 
-    // Protected rather than private: the slot table and the timeout wheel are
-    // the state a derived transport drives directly (the lwIP transport binds
-    // pcbs to slots, the fake drives time), which is what this base exists to
-    // share. An accessor pair per member would restate the same access with
-    // more indirection.
+    // misc-non-private-member-variables-in-classes: derived classes use it.
     // NOLINTBEGIN(misc-non-private-member-variables-in-classes)
     /// Live connections, one slot each, fixed at Capacity.
     SlotTableType clients_{};
     /// Deadlines armed against those slots, indexed the same way.
     detail::TimeoutScheduler<Capacity> timeouts_{};
-    // Closes the region opened above; the derived-access reason is there.
+    // misc-non-private-member-variables-in-classes: scope ends here.
     // NOLINTEND(misc-non-private-member-variables-in-classes)
 
    private:
-    /// Queue a disconnect for delivery after the outermost callback unwinds, or
-    /// deliver it now when nothing is on the stack. The queue holds two entries
-    /// per slot: one teardown each for a slot torn down, re-accepted and torn
-    /// down again within a single scope — more teardowns than that cannot be
-    /// raised before the scope unwinds, so overflow means the invariant this
-    /// class enforces is already broken. Delivering anyway would re-enter the
-    /// sink from inside a callback, which is exactly what deferral exists to
-    /// prevent, so abort instead of proceeding into that state.
+    /// Report disconnect now or queue it until callback return.
+    /// The queue holds two teardowns per slot within a scope. Overflow aborts
+    /// to prevent re-entry into the sink.
     void notify_disconnect(ConnectionId client, DisconnectReason reason) {
         if (callback_depth_ == 0) {
             deliver_disconnect(client, reason);
@@ -307,15 +261,8 @@ class TransportBase : public ITcpTransport {
         pending_[pending_count_++] = {client, reason};
     }
 
-    /// Deliver the queued disconnects.
-    ///
-    /// This runs at callback depth 0, so a sink that re-enters the transport
-    /// here opens a fresh CallbackScope whose unwind calls this again. Without
-    /// the guard that nested pass would restart at index 0 — the entries this
-    /// one already delivered are still queued — and redeliver them, recursing.
-    /// The guard makes the outermost pass the only one that delivers; a nested
-    /// call returns and leaves its entries for the loop below, which re-reads
-    /// pending_count_ each iteration and so drains late arrivals in this pass.
+    /// Drain notifications at callback depth zero. A guard leaves re-entrant
+    /// arrivals for the outer loop, preventing duplicate delivery.
     void flush_disconnects() {
         if (flushing_) {
             return;
