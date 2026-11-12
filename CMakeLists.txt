@@ -2,9 +2,8 @@ cmake_minimum_required(VERSION 3.26)
 
 include(cmake/pico_family_bootstrap.cmake)
 
-# AR-12. Firmware serves over the CYW43 radio, and pico-logging needs an
-# RP2350. As a dependency the board is the consumer's, and only that is checked
-# of it.
+# Firmware needs CYW43 for its radio and RP2350 for pico-logging; only the
+# consumer-selected board is checked (AR-12).
 pico_family_bootstrap(PICO_HTTP PLATFORM rp2350 CYW43)
 
 project(pico_http VERSION 0.1.0 LANGUAGES C CXX ASM)
@@ -12,53 +11,28 @@ project(pico_http VERSION 0.1.0 LANGUAGES C CXX ASM)
 house_cxx_common_settings(${PICO_HTTP_BUILD_FIRMWARE})
 pico_family_init_sdk(${PICO_HTTP_BUILD_FIRMWARE})
 
-# One source tree serves host and firmware, so both switches follow the
-# configure rather than being fixed.
-#
-# VENDOR_SOURCES takes the firmware flag: the Pico SDK attaches its own sources
-# through INTERFACE libraries that compile into whichever target links them, so
-# a target-scoped -Werror there would land on SDK and lwIP code. The four
-# cross-compiled sources this repository owns get it per source instead, in
-# src/*/CMakeLists.txt. The host tree links no SDK sources, so every diagnostic
-# there is this repository's to fix and the target carries the flag directly.
-#
-# FREESTANDING follows the toolchain, which is the helper's default: a firmware
-# image has no hosted libc behind _FORTIFY_SOURCE and no dynamic loader behind
-# the RELRO link options.
+# The SDK adds vendor sources to firmware targets, so owned sources take
+# -Werror per source. Host targets take it directly. Freestanding hardening
+# follows the toolchain.
 house_cxx_add_strict_target(pico_http_strict
     VENDOR_SOURCES ${PICO_HTTP_BUILD_FIRMWARE}
 )
 
-# Named sizing profile. "default" has a 2 KiB buffered body and a 2×MSS receive
-# window; "p8-rp2350" raises them to 8 KiB and 4×MSS with a 40-entry pbuf pool.
-# Both have a 4×MSS TX ring. The choice is whole-build: one set of compile
-# definitions feeds the HttpService profile, the transport buffer factors, and
-# lwipopts together, so the library, firmware examples (including their lwIP
-# sources), and tests are sized consistently.
-#
-# The definitions themselves are INTERFACE usage requirements on
-# pico_http_config (src/config), not directory-scoped compile definitions: they
-# determine class layout, and directory scope reaches only this repo's own
-# targets, which would leave a FetchContent or installed-package consumer
-# compiling its translation units against a different layout than the archive it
-# links.
+# Profile definitions propagate through pico_http_config because they
+# determine consumer class layouts.
 pico_family_declare_profile(PICO_HTTP NAME PROFILE
     DEFAULT default VALUES default p8-rp2350
     DOC "pico-http sizing profile: default or p8-rp2350")
 
-# Declares PICO_HTTP_SANITIZE. Build-wide rather than target-scoped, and ahead
-# of house_cxx_enable_gtest, so the fetched GoogleTest is instrumented too --
-# ASan's container-overflow detector needs both sides of a std::string boundary,
-# and add_compile_options reaches only targets created after it.
+# Sanitizers are set before creating GoogleTest so both sides of library
+# boundaries are instrumented.
 house_cxx_enable_sanitizers(PICO_HTTP)
 
-# Every knob this build has, declared before anything is added: a subdirectory
-# reading an option that has not been declared yet reads an empty string.
+# Options are declared before subdirectories read them.
 house_cxx_declare_tests_option(PICO_HTTP)
 
-# libFuzzer targets (Clang only). Declared here rather than beside the targets
-# themselves so that enabling it on a configure that cannot honour it reports
-# the reason instead of silently building nothing.
+# Fuzzing is declared here so unsupported configurations report why it is
+# unavailable.
 house_cxx_declare_fuzzers_option(PICO_HTTP)
 
 # Example firmware images (benchmark app, etc.) are firmware-only.
@@ -69,16 +43,11 @@ endif()
 option(PICO_HTTP_ENABLE_EXAMPLES "Build the firmware examples"
     ${PICO_HTTP_ENABLE_EXAMPLES_DEFAULT})
 
-# Install/export only when this is the top-level project: as a subproject the
-# parent owns the export set. Not host-only any more -- pico_http_tcp_lwip's SDK
-# links go through pico_family_sdk_link_libraries, which is the form an export
-# set can carry, so a firmware consumer can resolve this package through
-# find_package rather than only through FetchContent.
+# The top-level project owns package exports for host and firmware.
 house_cxx_declare_install_option(PICO_HTTP)
 
-# When pico-http's targets are exported, the fetched pico_logging target they
-# link must be in an export set too, so its install rules must be on. Before the
-# fetch below, or the dependency is configured with its default first.
+# Exported targets need their dependencies in an export set, so dependency
+# install rules are enabled before fetching.
 pico_family_propagate_install(PICO_HTTP PICO_LOGGING)
 
 pico_family_propagate_install(PICO_HTTP PICO_UTIL)
@@ -94,8 +63,8 @@ set(PICO_LWIPOPTS_TARGET "" CACHE STRING "Target carrying the application's lwip
 set(PICO_HTTP_WIFI_SSID "" CACHE STRING "Wi-Fi SSID the example firmware should join")
 set(PICO_HTTP_WIFI_PASSWORD "" CACHE STRING "Wi-Fi password (WPA2-PSK)")
 
-# The standalone device-test application offers a whole-build lwIP configuration
-# (AR-10). Select it explicitly for board runs; keep the CI fallback unchanged.
+# The device-test application offers an explicitly selected whole-build lwIP
+# configuration (AR-10).
 if(PROJECT_IS_TOP_LEVEL AND PICO_HTTP_BUILD_FIRMWARE)
     include(tests/device/lwipopts.cmake)
 endif()
@@ -111,22 +80,16 @@ if(PICO_HTTP_ENABLE_TESTS)
     add_subdirectory(tests)
 endif()
 
-# A host configure with -DPICO_HTTP_ENABLE_EXAMPLES=ON is a silent no-op rather
-# than an error: the images need the SDK.
+# Host builds ignore PICO_HTTP_ENABLE_EXAMPLES because the images need the
+# SDK.
 if(PICO_HTTP_ENABLE_EXAMPLES AND PICO_HTTP_BUILD_FIRMWARE)
     add_subdirectory(examples)
 endif()
 
 if(PICO_HTTP_ENABLE_INSTALL)
-    # house_cxx_install_package strips the namespace prefix from each exported
-    # name, so `pico_http::core` resolves identically through find_package and
-    # through FetchContent.
-    #
-    # pico_http_testing ships with the package. A downstream project writing
-    # tests against this library needs the same fakes this repository's own
-    # tests use; without them in the export set it has to build from source or
-    # write its own, and a hand-written double drifts from the seam it stands
-    # in for.
+    # house_cxx_install_package strips the namespace prefix so imported
+    # targets match source targets. Host test support is exported for
+    # downstream tests.
     set(PICO_HTTP_EXPORT_TARGETS
         pico_http_strict
         pico_http_core
@@ -144,12 +107,8 @@ if(PICO_HTTP_ENABLE_INSTALL)
         list(APPEND PICO_HTTP_EXPORT_TARGETS pico_http_device_lwipopts)
     endif()
 
-    # The export set is what this configuration actually built, and the two
-    # configurations differ at both ends. The lwIP transport is firmware-only:
-    # it is the one component touching the lwIP raw API and the cyw43 async
-    # context. The host-side fakes are host-only: they stand in for a transport
-    # an image already has. Naming a target that was never created fails the
-    # configure, so neither can be listed unconditionally.
+    # Only targets built in this configuration are exported: firmware lwIP or
+    # host test support.
     if(PICO_HTTP_BUILD_FIRMWARE)
         list(APPEND PICO_HTTP_EXPORT_TARGETS pico_http_tcp_lwip)
     else()
