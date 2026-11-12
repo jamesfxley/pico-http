@@ -1,9 +1,9 @@
 # Security policy
 
 Report vulnerabilities privately through the repository's Security tab and
-private vulnerability reporting. Include the affected version or commit,
-impact, and steps to reproduce. The maintainer aims to acknowledge a report
-within a week; this is an intention, not a response-time guarantee.
+private vulnerability reporting. Include the affected version or commit, impact,
+and steps to reproduce. The maintainer aims to acknowledge a report within a
+week, without guaranteeing a response time.
 
 The latest release is supported. There is no long-term support branch or
 commitment to backport fixes to earlier majors.

@@ -18,12 +18,12 @@ Cryptographic layers (TLS/HTTPS) are out of scope (§1; server-side TLS: FW-3).
 
 | | |
 |---|---|
-| Hardware targets | **Supported:** Pico 2 W (RP2350, 520 KB SRAM); its 0.1.0 validation record is pending (FW-4). The Pico W (RP2040) is refused at configure: pico-logging's atomics are not lock-free on ARMv6-M (FW-1). Both named profiles are sized for the Pico 2 W |
+| Hardware targets | **Supported:** Pico 2 W (RP2350, 520 KB SRAM); its 0.1.0 validation record is pending (FW-4). The Pico W (RP2040) fails configuration: pico-logging's atomics are not lock-free on ARMv6-M (FW-1). Both named profiles are sized for the Pico 2 W |
 | Network stack | lwIP **raw API** only (`NO_SYS=1`, `LWIP_SOCKET=0`, `LWIP_NETCONN=0`) via `pico_cyw43_arch_lwip_threadsafe_background` |
 | Protocol | HTTP/1.1 server subset defined in §9; HTTP/1.0 clients supported |
-| Out of scope | TLS/HTTPS (server-side TLS: FW-3); HTTP/2+; client-side HTTP; **off-core handler execution** (AR-9's deferred-completion contract is written to admit it, but no off-core executor is provided (FW-2); lwIP raw is single-context regardless, so the transport, parser and response writer stay on the async-context core); NTP/wall-clock time (`to_ms_since_boot` suffices; the `pico-time` sibling stays unlinked) |
+| Out of scope | TLS/HTTPS (server-side TLS: FW-3); HTTP/2+; client-side HTTP; off-core handler execution (AR-9's deferred-completion contract is written to admit it, but no off-core executor is provided (FW-2); lwIP raw is single-context regardless, so the transport, parser and response writer stay on the async-context core); NTP/wall-clock time (`to_ms_since_boot` suffices; the `pico-time` sibling stays unlinked) |
 
-Two named configuration profiles parameterize every numeric limit in this document:
+Two named profiles parameterise the numeric limits:
 
 - **Default**: 8 concurrent connections, a 2 KiB buffered body and a 2xMSS receive
   window. All §3 arithmetic uses this profile.
@@ -33,9 +33,9 @@ All limits are compile-time constants, set by the profile `PICO_HTTP_ACTIVE_PROF
 names and by the `PICO_HTTP_*` header caps (§3.5) and MSS factors (§3.4), so downstream projects
 can define their own profile; the two named profiles are the ones this project validates.
 
-**API stability:** the public API (`namespace pico_http`, headers under
-`pico_http/`) follows semantic versioning; a breaking change lands at a minor
-bump while the major version is 0, and at a major bump from 1.0.
+The public API in `namespace pico_http`, under the `pico_http/` header prefix,
+follows
+[EN-06.1](../infra/house/standard/engineering/06-release-and-versioning.md).
 
 Three API contracts referenced throughout this document:
 
@@ -62,11 +62,11 @@ These facts drive every number below:
    context switches, no RTOS primitives. A deferred handler (AR-9) does not
    change where work runs: `respond()` may be called from any context — core 1
    or an ISR — but it only records the completion and signals the async-context,
-   which serializes and sends on its next turn like every other response. The one
+   which serialises and sends on its next turn like every other response. The one
    piece of state genuinely shared across contexts is the per-slot completion
    record, guarded by a critical section (AR-3); everything else stays
    single-context.
-2. **Single lock.** All lwIP access is serialized by `cyw43_arch_lwip_begin()/end()`.
+2. **Single lock.** All lwIP access is serialised by `cyw43_arch_lwip_begin()/end()`.
    User handlers must run outside that lock (AR-3).
 3. **Time base.** `to_ms_since_boot(get_absolute_time())` provides a monotonic 1 ms
    tick. It wraps at 2³² ms ≈ 49.7 days; all deadline arithmetic must be wrap-safe
@@ -107,10 +107,10 @@ One slot of `HttpService` (AR-1, AR-4):
 | Item | Expression | Default | Rationale |
 |---|---|---:|---|
 | Parsed header storage | `sizeof(HTTPHeaders)` | 5,380 B | 16 headers at 64 B names / 256 B values, plus the count. The storage is `FixedString`, so each entry is its capacity rounded up to the alignment plus a length word: 16 x (72 + 264) = 5,376 B of entries. The largest per-slot knob (§3.5). |
-| Buffered request body | `Limits::MAX_BUFFERED_BODY` | 2,048 B | BR-5. A larger body is refused with `413`; there is one body path and it is buffered. |
+| Buffered request body | `Limits::MAX_BUFFERED_BODY` | 2,048 B | BR-5. A request with a larger body receives `413`; there is one body path and it is buffered. |
 | Request-line storage | `sizeof(FixedString<MAX_METHOD + 1>) + sizeof(FixedString<MAX_URI + 1>) + sizeof(FixedString<MAX_VERSION + 1>)` | 568 B | BR-1. The caps are 16 / 512 / 16; the stored sizes are 24 / 520 / 24. |
 | RX assembly buffer | `Profile::RX_CAPACITY` | 2,920 B | Must cover a full advertised window so no delivered byte is dropped (AR-6). |
-| Serialized response head | `Profile::HEAD_CAPACITY` | 1,024 B | Status line and header section. A head over this is answered `500` and closed, never truncated (BR-13). |
+| Serialised response head | `Profile::HEAD_CAPACITY` | 1,024 B | Status line and header section. A head over this is answered `500` and closed, never truncated (BR-13). |
 | Parser and writer state | cursors, phase, keep-alive counters, and the slot's own padding | 676 B | The balance of `sizeof(Conn)` against the rows above, which is what makes the total the compiler's figure rather than a sum that can drift from it. |
 | **Per-slot** | `HttpService::caller_binding().conn_size` | **12,616 B** | |
 | **x `MAX_CONNECTIONS`** | | **98.6 KiB** | |
@@ -136,14 +136,14 @@ copies the handler's bytes into one exact-sized heap buffer, which the slot take
 over rather than copies again (AR-1, AR-2), up to `MAX_BUFFERED_BODY` (BR-14). `set_body_static` and `set_body_generator` allocate nothing; the first takes a `StaticBody` rather than a bare span (AR-11).
 
 Handlers are given an `HTTPResponse` from a service-level pool of
-`MAX_PENDING_RESPONSES` objects, claimed at the start of a dispatch or a deferred
-completion and released when that turn's response head has been serialized — never
-held across a deferral (AR-9), because a deferring handler does not keep the
-object. The pool is therefore sized by how many dispatch turns can be live at
-once, not by how many requests are deferred. It is not one per slot: an
-`HTTPResponse` carries a full `HTTPHeaders`, the dominant per-slot cost (§3.5), so
-one per connection would add `MAX_CONNECTIONS x sizeof(HTTPResponse)` ~ 42 KiB to
-the init-time pool.
+`MAX_PENDING_RESPONSES` objects, claimed at the start of a dispatch or a
+deferred completion and released when that turn's response head has been
+serialised — never held across a deferral (AR-9), because a deferring handler
+does not keep the object. The pool is therefore sized by how many dispatch turns
+can be live at once, not by how many requests are deferred. It is not one per
+slot: an `HTTPResponse` carries a full `HTTPHeaders`, the dominant per-slot cost
+(§3.5), so one per connection would add `MAX_CONNECTIONS x sizeof(HTTPResponse)`
+~ 42 KiB to the init-time pool.
 
 A released entry is reset, so it holds no body buffer between turns: the
 connection slot takes a copied body over from the entry when the response
@@ -169,7 +169,7 @@ inadequate configuration is a compile error naming the setting.
 |---|---|
 | `NO_SYS == 1`, `LWIP_RAW == 1`, `LWIP_TCP == 1`, `LWIP_SOCKET == 0` | The transport is written against the raw `tcp_*` callbacks and driven from the SDK async context; there is no thread for a socket or netconn API. |
 | `LWIP_NETIF_TX_SINGLE_PBUF == 0` | The TX path hands `tcp_write` a pointer into the connection's own ring without `TCP_WRITE_FLAG_COPY` (AR-2). At 1, lwIP forces that flag and copies every sent byte into its heap; lwIP's `opt.h` documents the option as a compatibility aid for DMA MACs without scatter-gather that a driver must not rely on. That the CYW43 driver needs none is UNCONFIRMED by its documentation. |
-| `MEMP_NUM_PBUF >= MAX_CONNECTIONS * TCP_SND_QUEUELEN` | Each piece of ring queued takes a `PBUF_ROM` header, and `TCP_SND_QUEUELEN` caps the pbufs one connection may queue. Below it a write is refused and waits for the transport's poll, which appears as a stall rather than as a configuration error; lwIP's default of 16 is below what eight connections hold in flight. |
+| `MEMP_NUM_PBUF >= MAX_CONNECTIONS * TCP_SND_QUEUELEN` | Each piece of ring queued takes a `PBUF_ROM` header, and `TCP_SND_QUEUELEN` caps the pbufs one connection may queue. Below it a write returns `ERR_MEM` and is retried when the transport polls, which appears as a stall rather than as a configuration error; lwIP's default of 16 is below what eight connections hold in flight. |
 | `TCP_QUEUE_OOSEQ == 0` or `TCP_OOSEQ_MAX_PBUFS > 0` | An unbounded out-of-order queue lets a peer that withholds one segment pin RAM. |
 | `MEMP_NUM_TCP_PCB >= MAX_CONNECTIONS` | Otherwise `accept()` starves before the service reaches its own connection limit. |
 | `MEMP_NUM_TCP_PCB_LISTEN >= 1` | The service binds one listener. |
@@ -222,24 +222,24 @@ and writer state as the default, over a body of 8,192 B and a receive window of
 
 `P8Rp2350HttpProfile` (with `P8Rp2350HttpLimits`) carries the profile; select it
 whole-build with `-DPICO_HTTP_PROFILE=p8-rp2350`, which defines
-`PICO_HTTP_ACTIVE_PROFILE`, the buffer factors
-`PICO_HTTP_RX_WINDOW_MSS_FACTOR` / `PICO_HTTP_TX_RING_MSS_FACTOR`, and
-`PICO_HTTP_PROFILE_P8_RP2350` (which pairs the lwipopts values). Those definitions
-are usage requirements of the `pico_http::config` target, so a consumer compiles
-its own translation units against the same layout as the library it links; a
-profile that fails to reach a consumer is a compile error there, not a silent
-mismatch.
+`PICO_HTTP_ACTIVE_PROFILE`, the buffer factors `PICO_HTTP_RX_WINDOW_MSS_FACTOR`
+/ `PICO_HTTP_TX_RING_MSS_FACTOR`, and `PICO_HTTP_PROFILE_P8_RP2350` (which pairs
+the lwipopts values). Those definitions are usage requirements of the
+`pico_http::config` target, so a consumer compiles its own translation units
+against the same layout as the library it links; a consumer compiled against
+different values is detected when `HttpService` is constructed, which aborts.
 
 ### 3.5 Header-storage knob
 
 Parsed header storage is the dominant per-slot cost. The caps are **64 B names /
-256 B values** (BR-2), shared by both profiles; values beyond the cap are rejected
-with `431`, never silently truncated (BR-7). Both are set with the CMake cache
-variables `PICO_HTTP_MAX_HEADER_NAME` and `PICO_HTTP_MAX_HEADER_VALUE`, which
-put the value on `pico_http::config` as a usage requirement — they size storage
-the library and its consumers must agree on, so a `-D` on a consumer's own
-target is a layout mismatch rather than an override, and `ProfileBinding`
-refuses it at construction (§3.4).
+256 B values** (BR-2), shared by both profiles; values beyond the cap are
+rejected with `431`, never silently truncated (BR-7). Both are set with the
+CMake cache variables `PICO_HTTP_MAX_HEADER_NAME` and
+`PICO_HTTP_MAX_HEADER_VALUE`, which put the value on `pico_http::config` as a
+usage requirement — they size storage the library and its consumers must agree
+on, so a `-D` on a consumer's own target is a layout mismatch rather than an
+override, and the `HttpService` constructor aborts on the `ProfileBinding`
+mismatch (§3.4).
 
 `Limits::MAX_HEADER_LINE` is derived from the two, so the enforced cap and the
 advertised cap are the same number: raising the value cap raises what the parser
@@ -258,10 +258,10 @@ rejection and the storage never disagree.
 
 | ID | Requirement |
 |---|---|
-| **AR-1** | **Zero post-init heap.** No heap allocation after `HttpService::start()` returns. Init-time allocation (route table, `std::function` wiring) is permitted and is budgeted separately from static RAM: it happens once, before `start()`, and is bounded by the route table the application declares. *Bounded exception:* copied-mode `set_body` allocates one exact-sized body vector per response; the connection slot takes it over when the response begins and frees it once the response is sent. A copied body over `MAX_BUFFERED_BODY` is never copied: `set_body` refuses it before allocating and the service answers `500` (BR-14), and a body a handler reserves or writes directly is refused over the cap, or trimmed to its size when its capacity exceeds the cap, before the slot takes it. Live copied-body allocation is therefore at most one body per connection while a response is in flight — hard-bounded by `MAX_CONNECTIONS × MAX_BUFFERED_BODY` — and zero once the connections are idle; a handler that reserves or writes `body` directly allocates what it asks for while it runs. Static and generator bodies allocate zero. That copied bodies leave nothing behind once sent is asserted on device (t18). Verified by a net-heap watermark — `pico_util::HeapWatermark` over mallinfo `uordblks` — held at zero growth across t15's static- and generator-body workload and inside the copied-body bound above across the soak (t7), not by a per-allocation hook: the Pico SDK exposes no malloc hook, so the measurable quantity is net growth, and an allocation freed before the sample is one it cannot see. That is also why the counter is a byte figure rather than an allocation count (OR-1). |
+| **AR-1** | **No post-init heap except copied bodies.** No heap allocation after `HttpService::start()` returns. Init-time allocation (route table, `std::function` wiring) is permitted and is budgeted separately from static RAM: it happens once, before `start()`, and is bounded by the route table the application declares. *Bounded exception:* copied-mode `set_body` allocates one exact-sized body vector per response; the connection slot takes it over when the response begins and frees it once the response is sent. A copied body over `MAX_BUFFERED_BODY` is never copied: `set_body` returns `BodyResult::REFUSED` before allocating and the service answers `500` (BR-14), and a body a handler reserves or writes directly is answered with the fixed `500` over the cap, or trimmed to its size when its capacity exceeds the cap, before the slot takes it. Live copied-body allocation is therefore at most one body per connection while a response is in flight — hard-bounded by `MAX_CONNECTIONS × MAX_BUFFERED_BODY` — and zero once the connections are idle; a handler that reserves or writes `body` directly allocates what it asks for while it runs. Static and generator bodies allocate zero. That copied bodies leave nothing behind once sent is asserted on device (t18). Verified by a net-heap watermark — `pico_util::HeapWatermark` over mallinfo `uordblks` — held at zero growth across t15's static- and generator-body workload and inside the copied-body bound above across the soak (t7), not by a per-allocation hook: the Pico SDK exposes no malloc hook, so the measurable quantity is net growth, and an allocation freed before the sample is one it cannot see. That is also why the counter is a byte figure rather than an allocation count (OR-1). |
 | **AR-2** | **Copy budget, bounded per direction.** RX: every received byte is copied once from its pbuf into the slot's RX assembly buffer (AR-6), which the parser reads; the request line and header bytes are copied through the parser's token scratch into the stored fields (§3.1), so a request view outlives the buffer's compaction (AR-9); a request body is copied once more into the parser's body buffer (BR-5); bytes not yet consumed are moved to the front of the assembly buffer as it drains; TX: `tcp_write` **without** `TCP_WRITE_FLAG_COPY` from the static TX ring (AR-10 asserts `LWIP_NETIF_TX_SINGLE_PBUF` 0, without which lwIP copies it again) (the 1 copy is body→ring, for every body source: a static body is copied from its storage, a generator's output from its scratch). Buffered mode adds, before that, `set_body`'s copy of the handler's bytes into its body buffer, which is the mode's purpose, and one exact-sized copy when a handler reserved that buffer past `MAX_BUFFERED_BODY` (AR-1); static and generator bodies make neither of those. Established by review of the RX and TX paths: no runtime copy counter exists, and `t17` compares the two body modes without counting copies. |
 | **AR-3** | **Lock discipline.** All lwIP calls run under `cyw43_arch_lwip_begin()/end()`; user callbacks are invoked outside the lock. p99 lock hold time ≤ 500 µs, measured in a debug build during t5 load. The deferred-completion record (AR-9) is additionally guarded by a critical section, held only for the stores that publish or claim it — bounded, containing no lwIP call, and safe to take from an ISR. |
-| **AR-4** | **Handle safety.** Public connection handles are `{slot index, generation}` integer IDs — never raw `tcp_pcb*`. Operations on stale handles are detected via generation mismatch and become inert no-ops (ABA-safe). |
+| **AR-4** | **Handle safety.** Public connection handles are `{slot index, generation}` integer IDs — never raw `tcp_pcb*`. Operations on stale handles are inert while the slot generation differs. A slot's 16-bit generation repeats after 65,535 releases of that slot. |
 | **AR-5** | **Backpressure, never truncation.** Response size is unbounded by memory: a resumable response writer driven by `tcp_sent` fills the TX ring as ACKs free space. A send is never silently dropped for want of room. |
 | **AR-6** | **RX flow control.** `tcp_recved()` is called only for bytes actually consumed by the parser/handler. Unconsumed data closes the advertised window instead of being dropped, so silent truncation of delivered bytes is structurally impossible. |
 | **AR-7** | **Wrap-safe millisecond time base.** All deadlines use `to_ms_since_boot` with signed-difference comparison, correct across the 49.7-day wrap. |
@@ -269,7 +269,7 @@ rejection and the storage never disagree.
 | **AR-9** | **Deferred completion.** A handler may return `Disposition::PENDING` and resolve the request later via `respond(RequestId, ResponseFiller, void*)`. For the whole deferred window the request views (method, URI, headers, body) stay valid and the connection consumes no further pipelined request — buffered bytes hold the receive window closed against the peer exactly as they do behind a backpressured response (AR-6), so a deferring handler applies backpressure rather than accumulating work. The handler does **not** hold the response object across the window: it supplies a filler that the service invokes at completion time, and only if the request is still live, so a late completion cannot write into a recycled entry. `RequestId` is request-scoped — {generation-tagged connection id, request sequence} — so a completion arriving after the connection timed out, was reset, or was reclaimed by a server stop is inert (AR-4), and one arriving after that same connection has begun a later request cannot resolve that later request instead; a second `respond()` for the same request is likewise inert. `respond()` allocates nothing, makes no lwIP call and performs no send: it records the completion under a bounded critical section (AR-3) and signals the async-context, which sends on its next turn. It is therefore safe from any context, including core 1 and an ISR. The deferred window is bounded by TR-6, the number of concurrent deferrals by BR-12. |
 | **AR-10** | **The application owns `lwipopts.h`.** This library asserts what it requires of a configuration and provides none. lwIP admits one configuration per image and the SDK compiles lwIP into whichever target links its INTERFACE libraries, so a library supplying one gives an application linking two networking libraries two lwIP builds whose struct layouts disagree, resolved by archive order (`CXX-10.3`). A firmware configure fails unless `PICO_LWIPOPTS_TARGET` names the application's target — the variable is the family's, so an application linking pico-http and a sibling names its configuration once. The requirements are §3.2, each a `static_assert` in a single translation unit, so an inadequate configuration is a compile error naming the setting rather than a fault under load. |
 | **AR-11** | **A caller-owned body declares its lifetime in its type.** `set_body_static` takes a `StaticBody`, which only `StaticBody::outliving_response()` constructs, and whose name is the caller's assertion, written at the call site rather than made silently by a conversion. A `std::span` or `std::string_view` does not convert, so a view into `HTTPRequestView` cannot be served as a static body. That storage is the connection's parser buffer, recycled when the handler returns, and the writer re-reads a static body on every backpressure resume -- potentially long after that. |
-| **AR-12** | **A board without an RP2350 and the CYW43 radio is refused at configure.** The server runs over the radio, and pico-logging needs the RP2350's exclusive access, so the library declares `PLATFORM rp2350 CYW43` to pico-tooling's bootstrap, which refuses a board without what a library declares. A consumer adding it on such a board fails at configure, naming what the board lacks, rather than in the build or on the device. The Pico W (RP2040) is therefore refused at configure (FW-1). |
+| **AR-12** | **Configuration fails for a board without an RP2350 and the CYW43 radio.** The server runs over the radio, and pico-logging needs the RP2350's exclusive access, so the library declares `PLATFORM rp2350 CYW43` to pico-tooling's bootstrap, which fails the configure for a board without what a library declares. A consumer adding it on such a board fails at configure, naming what the board lacks, rather than in the build or on the device. Configuration therefore fails for the Pico W (RP2040) (FW-1). |
 
 ## 5. Performance requirements (PR)
 
@@ -293,7 +293,7 @@ separately.
 | ID | Metric | Documented expectation / functional criterion | Test |
 |---|---|---|---|
 | PR-1 | Keep-alive `GET /ping` TTLB | p50 ≤ 8 ms, p99 ≤ 40 ms | t1 |
-| PR-2 | TTFB, and internal processing share of it (parse + route + handler + serialize, timed per receive callback up to its first send) | p50 ≤ 6 ms; internal share ≤ 1 ms for ≥ 99 % of receive callbacks | t1 |
+| PR-2 | TTFB, and internal processing share of it (parse + route + handler + serialise, timed per receive callback up to its first send) | p50 ≤ 6 ms; internal share ≤ 1 ms for ≥ 99 % of receive callbacks | t1 |
 | PR-3 | Aggregate RPS, 8 keep-alive connections | ≥ 250 | t5 |
 | PR-4 | Connection churn (connect + GET + close) | p50 ≤ 25 ms driven serially; ≥ 150 accepts/s driven by `MAX_CONNECTIONS` workers | t2 |
 | PR-5 | Single-connection download throughput | p10 (nearest rank) of 20 transfers ≥ 400 KB/s at every response size from 16 KiB (theory: the 5,840 B ring / ~6 ms RTT ≈ 950 KB/s in flight, before the request's round trip and lwIP's 3×MSS initial window) | t3 |
@@ -308,10 +308,10 @@ separately.
 |---|---|---|
 | RR-1 | 100 consecutive peer RST/aborts mid-request leak **zero** slots; all 8 slots accept immediately afterwards, and `/stats` shows `active_connections <= 1` — the requesting connection is itself active, so 1 is the idle baseline — and `disconnect_peer_reset >= 98`, the ±2 covering a shot the device classifies as a plain close. | t8 |
 | RR-2 | **Recovery SLO:** after any 1,000-event mixed-abuse run (RSTs, malformed frames, slowloris), a fresh client receives a `/ping` response within 1 s. | t21 |
-| RR-3 | **Slot exhaustion:** the 9th concurrent connection is refused at the TCP layer (the accept callback aborts the pcb and returns `ERR_ABRT` → RST), counted in `refusals_slot_full`; the existing 8 connections are unaffected. | t5 |
-| RR-4 | **Abuse soak:** zero heap drift beyond the bounded copied-body growth AR-1 permits, zero slot leaks, counter set self-consistent, and no allocation lwIP refuses from its heap or its pbuf, segment and `PBUF_ROM` pools. A run's record states its duration. | t7, t21 |
+| RR-3 | **Slot exhaustion:** the 9th concurrent connection receives a TCP RST (the accept callback aborts the pcb and returns `ERR_ABRT` → RST), counted in `refusals_slot_full`; the existing 8 connections are unaffected. | t5 |
+| RR-4 | **Abuse soak:** zero heap drift beyond the bounded copied-body growth AR-1 permits, zero slot leaks, counter set self-consistent, and no failed lwIP allocation from its heap or its pbuf, segment and `PBUF_ROM` pools. A run's record states its duration. | t7, t21 |
 | RR-5 | Keep-alive reuse rate ≥ 99 % when the client requests it within configured limits. | t6 |
-| RR-6 | **pbuf-pool pressure:** every slot's receive window full at once — the most the pool sizing AR-10 requires (§3.2) lets arrive, so the pool cannot be starved through receive windows — degrades to window throttling; never stream corruption, a dropped byte, a crash, or an allocation lwIP refuses from its heap or its pbuf, segment and `PBUF_ROM` pools. | t22 |
+| RR-6 | **pbuf-pool pressure:** every slot's receive window full at once — the most the pool sizing AR-10 requires (§3.2) lets arrive, so the pool cannot be starved through receive windows — degrades to window throttling; never stream corruption, a dropped byte, a crash, or a failed lwIP allocation from its heap or its pbuf, segment and `PBUF_ROM` pools. | t22 |
 
 ## 7. Boundary enforcement (BR)
 
@@ -330,24 +330,24 @@ agree on and so cannot be set per-consumer.
 | BR-3 | Max header count | 16 | `431` | `Limits::MAX_HEADERS` |
 | BR-4 | Max total request head | 2,048 B | `431` | `Limits::MAX_REQUEST_HEAD` |
 | BR-5 | Max buffered body | 2,048 B | `413` | `Limits::MAX_BUFFERED_BODY` |
-| BR-6 | Max concurrent connections | 8 | TCP-level refusal (no HTTP response) | `pico_http::MAX_CONNECTIONS` |
+| BR-6 | Max concurrent connections | 8 | TCP RST without an HTTP response | `pico_http::MAX_CONNECTIONS` |
 | BR-7 | Header storage overflow (`HTTPHeaders::set` failure) | — | `431` — **never a silent drop or truncation** | — |
 | BR-8 | Malformed syntax (method/version charset, request-line spacing, header framing, control chars in a field value) | — | `400` | — |
 | BR-9 | `Transfer-Encoding` other than a lone `chunked` | — | `501`. A lone `chunked` is decoded per §9; never misparsed as a zero-length body. | — |
 | BR-10 | Missing or duplicated `Host` header on an HTTP/1.1 request (RFC 9112 §3.2) | — | `400` | — |
 | BR-11 | Well-formed but unsupported HTTP version (`HTTP/<DIGIT>.<DIGIT>` that is not 1.0/1.1, e.g. `HTTP/2.0`) | — | `505` (RFC 9110 §15.6.6); a token that is not HTTP-version syntax is `400` (BR-8) | — |
 | BR-12 | Max concurrent deferred requests (AR-9) | 4 | `503` | `Profile::MAX_PENDING_RESPONSES` |
-| BR-13 | Max serialized response head (status line and header section a handler builds) | 1,024 B | `500` with `Content-Length: 0` and `Connection: close`, the handler's head and body dropped; never truncated, never a silent close | `Profile::HEAD_CAPACITY` |
-| BR-14 | Max copied response body (`set_body`), held in the slot until sent | 2,048 B | `set_body` copies nothing and marks the response refused; the service answers the same fixed `500` as BR-13, counted in `responses_refused`. A larger body is served static or generated | `Limits::MAX_BUFFERED_BODY` |
+| BR-13 | Max serialised response head (status line and header section a handler builds) | 1,024 B | `500` with `Content-Length: 0` and `Connection: close`, the handler's head and body dropped; never truncated, never a silent close | `Profile::HEAD_CAPACITY` |
+| BR-14 | Max copied response body (`set_body`), held in the slot until sent | 2,048 B | `set_body` copies nothing and sets `body_refused`; the service answers the same fixed `500` as BR-13, counted in `responses_refused`. A larger body is served static or generated | `Limits::MAX_BUFFERED_BODY` |
 
 BR-12 is enforced where a handler returns `PENDING`, not on arrival: a request
-whose handler answers inline is never counted against it, so a saturated deferral
-cap cannot refuse ordinary synchronous traffic. Boundary responses — BR-12's
-`503` and the BR-1..BR-11 parse rejections — are built in a stack-local
-`HTTPResponse` and serialized straight into the connection's response writer, so
-they need neither a deferral slot nor the heap. BR-12 is an overload condition
-rather than a malformed request, so it is counted separately (`deferrals_refused`,
-OR-1) and never in `parse_errors`.
+whose handler answers inline is never counted against it, so a saturated
+deferral cap cannot answer ordinary synchronous traffic with `503`. Boundary
+responses — BR-12's `503` and the BR-1..BR-11 parse rejections — are built in a
+stack-local `HTTPResponse` and serialised straight into the connection's
+response writer, so they need neither a deferral slot nor the heap. BR-12 is an
+overload condition rather than a malformed request, so it is counted separately
+(`deferrals_refused`, OR-1) and never in `parse_errors`.
 
 ## 8. Timing and timeout requirements (TR)
 
@@ -358,7 +358,7 @@ on state transitions.
 
 | ID | Timeout | Default | Precision | Purpose |
 |---|---|---|---|---|
-| TR-1 | Header completion (accept → head complete) | 5,000 ms | ± 200 ms | Slowloris defense |
+| TR-1 | Header completion (accept → head complete) | 5,000 ms | ± 200 ms | Slowloris defence |
 | TR-2 | Body inter-progress (no forward progress while reading body) | 5,000 ms | ± 200 ms | Minimum-data-rate proxy |
 | TR-3 | Keep-alive idle | 15,000 ms | ± 200 ms | Reclaims idle slots (configurable, existing API) |
 | TR-4 | Write stall (no ACK progress while a response is pending) | 10,000 ms | ± 200 ms | Slow-reader bound |
@@ -374,9 +374,9 @@ what makes the handler's eventual `respond()` inert (AR-4).
 
 | ID | Requirement |
 |---|---|
-| NR-1 | Request-line parsing: exactly `METHOD SP URI SP VERSION CRLF`; method validated as an RFC 9110 token; overlong methods receive 400 because bounded token storage refuses them before dispatch (RFC 9112 §3 recommends 501); version parsed as `HTTP/<DIGIT>.<DIGIT>` — `1.0`/`1.1` accepted, other well-formed versions → `505` (BR-11), non-version tokens → `400` (BR-8). Exactly one empty line (CRLF) before the request-line is ignored (RFC 9112 §2.2); a second, or a bare LF, → `400`. |
+| NR-1 | Request-line parsing: exactly `METHOD SP URI SP VERSION CRLF`; method validated as an RFC 9110 token; overlong methods receive 400 because they overflow bounded token storage before dispatch (RFC 9112 §3 recommends 501); version parsed as `HTTP/<DIGIT>.<DIGIT>` — `1.0`/`1.1` accepted, other well-formed versions → `505` (BR-11), non-version tokens → `400` (BR-8). Exactly one empty line (CRLF) before the request-line is ignored (RFC 9112 §2.2); a second, or a bare LF, → `400`. |
 | NR-2 | HTTP/1.0 vs 1.1 semantics: 1.1 default keep-alive, 1.0 default close, `Connection` header token parsing (case-insensitive, comma-separated). A response `Connection` header set by a handler overrides the version default; the per-connection request cap (`KeepAliveConfig::max_requests_per_connection`) and a framing decision that forces the connection closed both override the handler in turn — the cap bounds how long one peer holds a slot, so a handler must not be able to switch it off — and the emitted head carries the service's decision — a handler-set `Connection`/`Keep-Alive` on a response the service is closing is suppressed rather than echoed, so the head never announces persistence the server will not honour. |
-| NR-3 | `Content-Length` hygiene: strict decimal parse with overflow check; duplicate or conflicting `Content-Length` headers → `400` (request-smuggling defense). `Content-Length` + `Transfer-Encoding` together → `400`. |
+| NR-3 | `Content-Length` hygiene: strict decimal parse with overflow check; duplicate or conflicting `Content-Length` headers → `400` (request-smuggling defence). `Content-Length` + `Transfer-Encoding` together → `400`. |
 | NR-4 | `Transfer-Encoding` handling per BR-9: chunk-size hex parse with overflow bounds, trailers consumed and discarded, chunk extensions ignored (control octets in either → `400`). `Transfer-Encoding` on an HTTP/1.0 request is faulty framing → `400` (RFC 9112 §6.1). |
 | NR-5 | `Expect: 100-continue`: send `100 Continue` when the declared body is within limits; otherwise respond `413` without reading the body. On HTTP/1.0 the 100-continue expectation is ignored and no 1xx is sent (RFC 9110 §10.1.1, §15.2). Any other expectation → `417` (RFC 9110 §10.1.1) — never silently ignored. |
 | NR-6 | Response framing: every response carries an explicit `Content-Length`, or `Transfer-Encoding: chunked` for generator bodies of unknown length; HTTP/1.0 clients get length-delimited or close-delimited framing, never chunked. |
@@ -434,16 +434,16 @@ them; review checks these citations (EN-02.1).
 
 | Req | Test(s) | Pass criterion |
 |---|---|---|
-| AR-1 | t15, t7, t18; `pico_http_http_tests` — `SetBodyOverTheCapAllocatesNothing`, `ARefusedCopiedBodyIsFreedNotHeld`, `SpareBodyCapacityIsNotCarriedIntoTheSlot`, `ASentCopiedBodyIsNotHeldByTheSlot`, `ACopiedBodyStalledMidSendIsFreedWhenThePeerResets` | `post_init_heap_growth_bytes` is 0 across t15's static- and generator-body workload and bounded by `MAX_CONNECTIONS × MAX_BUFFERED_BODY` across the soak; t18 finds copied bodies served on every slot, repeated and at a smaller size, leave no growth once the slots are idle; on the host, a refused body allocates nothing, no slot holds more than `MAX_BUFFERED_BODY` in flight, and a sent or torn-down response leaves its slot holding nothing. |
+| AR-1 | t15, t7, t18; `pico_http_http_tests` — `SetBodyOverTheCapAllocatesNothing`, `ARefusedCopiedBodyIsFreedNotHeld`, `SpareBodyCapacityIsNotCarriedIntoTheSlot`, `ASentCopiedBodyIsNotHeldByTheSlot`, `ACopiedBodyStalledMidSendIsFreedWhenThePeerResets` | `post_init_heap_growth_bytes` is 0 across t15's static- and generator-body workload and bounded by `MAX_CONNECTIONS × MAX_BUFFERED_BODY` across the soak; t18 finds copied bodies served on every slot, repeated and at a smaller size, leave no growth once the slots are idle; on the host, a rejected copied body allocates nothing, no slot holds more than `MAX_BUFFERED_BODY` in flight, and a sent or torn-down response leaves its slot holding nothing. |
 | AR-2 | Review of the RX and TX paths; `t17` compares the body modes | RX copies each byte pbuf→assembly buffer, the head through the parser's scratch into its stored fields, and a body once more into the parser's body buffer; TX copies each body source once into the static ring and writes from it without `TCP_WRITE_FLAG_COPY`, buffered mode adding `set_body`'s copy (and the over-reserved trim). Review-only: no runtime counter exists |
 | AR-3 | t5 on a Debug build | **Device-internal; mechanised.** p99 lock hold ≤ 500 µs under 8-connection load. A Release build compiles the sampler out, and `t5` reports AR-3 there as not measured (`ar3_measured` false) rather than claiming a pass |
 | AR-4 | `pico_http_tcp_tests` | Stale-handle/ABA tests: generation mismatch → no-op |
 | AR-5 | t11, t12, `pico_http_http_tests`; `tests/device/main.cpp` — `tcp-ack-resumes-complete-response` | 256 KB bit-exact; slow reader isolated; resume-after-ack unit tests. Device case: withhold peer receive credit until the real TCP window fills and the response writer reports backpressure, then release credit; the peer receives the exact deterministic body of three TX rings through EOF. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
 | AR-6 | t13, `pico_http_http_tests`; `tests/device/main.cpp` — `tcp-window-reopens-after-consumption` | Throttle counter > 0 under stall, zero corruption; consume/window unit tests. Device case: park the first request PENDING while a known pipeline longer than TCP_WND arrives; require rx_window_throttle_events > 0 and the peer sender window to reach zero before releasing the pending request, then receive every complete numbered response in order with rx_overflow_drops = 0. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
 | AR-7 | `pico_http_tcp_tests` | Deadline tests across the 2³² ms wrap boundary |
-| AR-8 | t1 | **Network-measured; review.** Record the latency distribution and assess modes or jumps against earlier matched runs and RF health; ~200 ms delayed-ACK behavior is a documented expectation to investigate, not a numerical gate. The Nagle-disable implementation remains required. |
+| AR-8 | t1 | **Network-measured; review.** Record the latency distribution and assess modes or jumps against earlier matched runs and RF health; ~200 ms delayed-ACK behaviour is a documented expectation to investigate, not a numerical gate. The Nagle-disable implementation remains required. |
 | AR-9 | `pico_http_http_tests`, t19; `tests/device/main.cpp` — `irq-deferred-completion-runs-on-async-context` | View lifetime across the deferred window; pipelining held; stale and duplicate `respond()` inert. t19 mechanises positive work and dispatches covering completions, no heavy errors/timeouts and no stranded entries. Its offered-load ratio, client-observed synchronous/deferred p99, improvement and 40 ms expectation are network-measured review evidence. Device case: a 10 us repeating timer and mainline race different fillers for one real parked request. Exactly one eligible publisher succeeds, one filler runs under the SDK async-context lock and the peer receives exactly the winning body. Require 256 observed IRQ landings inside the mainline respond bracket; coverage is statistical, not proof of every interleaving. A fresh unanswered request is torn down; its completion then returns false without running its filler. A new connection must reuse that slot with a different generation; the stale id stays inert before and during its parked request, emits no bytes, and the live request completes normally. The bounded sampling interval and conservative instruction-count derivation are described below. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
-| AR-10 | `lwipopts_assertions.hpp` in `lwip_tcp_transport.cpp`; the `consumer` gate cases in `house.toml`; case `lwipopts-required` at producer-configure, expecting `PICO_LWIPOPTS_TARGET must name the target` | Every §3.2 relation is a `static_assert`; the configure is refused with a diagnostic naming the variable; no target puts an `lwipopts.h` on the include path unless it is named |
+| AR-10 | `lwipopts_assertions.hpp` in `lwip_tcp_transport.cpp`; the `consumer` gate cases in `house.toml`; case `lwipopts-required` at producer-configure, expecting `PICO_LWIPOPTS_TARGET must name the target` | Every §3.2 relation is a `static_assert`; the configure fails with a diagnostic naming the variable; no target puts an `lwipopts.h` on the include path unless it is named |
 | AR-11 | Compiler; `pico_http_http_tests` -- `ARequestViewCannotBecomeAStaticBody` | `set_body_static(request.body, ...)` does not compile: `cannot convert 'std::span<const unsigned char>' to 'pico_http::StaticBody'`. The test asserts the property the diagnostic rests on -- that neither a span nor a string view converts -- so a conversion added later fails there rather than silently restoring the trap. |
 | AR-12 | the `consumer` gate cases `pico-w-refused` and `pico2-refused`, a consumer adding the library | On `pico_w` the configure fails saying `PICO_HTTP needs PICO_PLATFORM rp2350`; on `pico2`, saying `PICO_HTTP needs a board with the CYW43 radio` |
 | PR-1 | t1 | **Network-measured; review.** t1 records latency percentiles (expectations p50 8 ms, p99 40 ms) and history comparisons. Review the same profile/build type, conditions and RF-health bursts for trends and jumps; no numerical miss fails the run. |
@@ -451,21 +451,21 @@ them; review checks these citations (EN-02.1).
 | PR-3 | t5 | **Network-measured; review.** Record RPS at eight connections (expectation 250) and history comparison. Workload errors, RR-3 and Debug AR-3 remain mechanised. |
 | PR-4 | t2 | **Network-measured; review.** Record serial connection p50 (expectation 25 ms) and device accepts under max-connection client load (expectation 150/s), alongside client rate/stalls and history. Accept counts use the board counter, but the measurement interval/load crosses Wi-Fi, so the rate is not device-internal. Failed exchanges or missing required stats remain mechanised failures. |
 | PR-5 | t3 | **Network-measured; review.** At each swept size from 16 KiB, record 20 transfers and p10/median/min throughput (expectation p10 400 KB/s), plus history comparison. Review trends with conditions and RF health. Completion/truncation checks remain mechanised, with no speed gate. |
-| PR-6 | t20 | **Network-measured; review.** Record aggregate and stall-free throughput at max connections (stall-free expectation 600 KB/s), stalls and history comparison. Complete transfers and zero refused lwIP allocations remain mechanised requirements. |
+| PR-6 | t20 | **Network-measured; review.** Record aggregate and stall-free throughput at max connections (stall-free expectation 600 KB/s), stalls and history comparison. Complete transfers and zero failed lwIP allocations remain mechanised requirements. |
 | PR-7 | t4 | **Network-measured; review.** Record buffered upload throughput (expectation 200 KB/s) and checksum/size observations at the accepted boundary, plus history comparison. No upload-speed verdict. |
 | PR-8 | t11 | 256 KB download bit-exact |
 | PR-9 | t20 | **Network-measured; review.** Record worst inter-read gap and comparison with history. The documented expectation is `2 * tcp_rto_ms / 1000 + 0.25` seconds; it and the recorded 10% reference comparison are informational, not limits. Complete transfers and allocation checks remain mechanised. |
 | RR-1 | t8 | 0 slots leaked after 100 RSTs; immediate full-capacity accept |
 | RR-2 | t21 | After 1,000 events rotating through a peer RST mid-request, a malformed request line (`400`), a header line over the cap (`431`) and a slowloris head, a fresh client's `/ping`, timed from connect to the full response, completes within 1 s while two slowloris heads still hold their slots, and the device reclaims those through the header timeout; every abuse request gets its expected status |
-| RR-3 | t5; `tests/device/main.cpp` — `tcp-refuses-one-past-slot-cap` | 9th connection refused; 8 existing unaffected. Device case: hold the active profile MAX_CONNECTIONS live peers; one more gets ERR_RST with no HTTP bytes, refusals_slot_full increments once, and every original peer still receives its exact response. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
-| RR-4 | t7, t21; `pico_http_http_tests` — `TheCountersAccountForEveryConnection` | t7 under mixed load and t21 under abuse, each recording its duration: no request errors (t7), no allocation lwIP refused from its heap or its pbuf, segment and `PBUF_ROM` pools (t7; `/lwip_stats` `err`), heap inside AR-1's bound (both) and flat (t7), every slot free once the load stops (`active_connections` back to the measuring connection within 20 s), and `accepts` plus the connections open at the reset (reported by `/stats/reset`) equal every disconnect reason plus `active_connections`, the timeout total its kinds and `parse_errors` its classes. The host case holds the same identities across every close path |
+| RR-3 | t5; `tests/device/main.cpp` — `tcp-refuses-one-past-slot-cap` | 9th connection receives a TCP RST; 8 existing connections are unaffected. Device case: hold the active profile MAX_CONNECTIONS live peers; one more gets ERR_RST with no HTTP bytes, refusals_slot_full increments once, and every original peer still receives its exact response. Evidence covers the library lwIP glue over loopback, bypassing the CYW43 Wi-Fi path. |
+| RR-4 | t7, t21; `pico_http_http_tests` — `TheCountersAccountForEveryConnection` | t7 under mixed load and t21 under abuse, each recording its duration: no request errors (t7), no failed lwIP allocation from its heap or its pbuf, segment and `PBUF_ROM` pools (t7; `/lwip_stats` `err`), heap inside AR-1's bound (both) and flat (t7), every slot free once the load stops (`active_connections` back to the measuring connection within 20 s), and `accepts` plus the connections open at the reset (reported by `/stats/reset`) equal every disconnect reason plus `active_connections`, the timeout total its kinds and `parse_errors` its classes. The host case holds the same identities across every close path |
 | RR-5 | t6 | Reuse rate ≥ 99 %, adjudicated by the run: every request after the first on a connection and within the keep-alive limit counts as one relying on reuse, so a server closing early lowers the rate rather than shortening the denominator |
-| RR-6 | t22 | Every slot at once holds a backpressured 64 KiB download with 8 KiB of requests pipelined behind it, more than any profile's receive window; then every response is bit-exact and complete, `rx_window_throttle_events` is at least `MAX_CONNECTIONS`, `rx_overflow_drops` is 0, lwIP refused no allocation from its heap or its pbuf, segment and `PBUF_ROM` pools, and the device still serves. The pool's high-water mark since boot and `tcp.memerr`, which also counts writes refused for a full send queue, are recorded beside the verdict |
+| RR-6 | t22 | Every slot at once holds a backpressured 64 KiB download with 8 KiB of requests pipelined behind it, more than any profile's receive window; then every response is bit-exact and complete, `rx_window_throttle_events` is at least `MAX_CONNECTIONS`, `rx_overflow_drops` is 0, lwIP reported no failed allocation from its heap or its pbuf, segment and `PBUF_ROM` pools, and the device still serves. The pool's high-water mark since boot and `tcp.memerr`, which also counts writes for which `tcp_write` returned `ERR_MEM`, are recorded beside the verdict |
 | BR-1..BR-11 | t10 (`Boundary matrix`); t5 (BR-6); `pico_http_http_tests` | Each boundary returns the status and close semantics its row in the boundary table states. Over the wire t10 reaches BR-1, BR-3, BR-5, BR-8, BR-9 and BR-11. BR-2 (single header line), BR-4 (head total), BR-7 (header storage overflow) and BR-10 (`Host`) are the parser and headers suites', which reach limits t10 cannot drive over the wire — BR-4 needs a `MAX_REQUEST_HEAD` small enough to trip before the header count does. BR-6 is the connection cap and belongs to t5 |
 | BR-12 | `pico_http_http_tests` | Exhaustion → `503` + `Connection: close`; pool entry released on every teardown path |
 | BR-13 | `pico_http_http_tests` — `OversizedResponseHeadYields500NotSilentClose`, `OversizedResponseHeadSendsOnlyTheFixed500` | A handler head over `HEAD_CAPACITY` yields exactly the fixed `500 Internal Server Error` head with `Content-Length: 0` and `Connection: close`, nothing of the handler's head or body follows, and the connection closes |
-| BR-14 | `pico_http_http_tests` — `SetBodyOverTheCapAllocatesNothing`, `SetBodyAtTheCapIsCopiedAndClearsARefusal`, `CopiedBodyOverTheCapIsAnswered500`, `ARefusedCopiedBodyIsFreedNotHeld`, `CopiedBodyAtTheCapIsServed` | `set_body` over the cap leaves no buffer allocated and the response refused; a copied body one byte over `MAX_BUFFERED_BODY` yields exactly the fixed `500` head, closes and counts `responses_refused`, and the live heap afterwards does not hold a refused copied body; one of exactly `MAX_BUFFERED_BODY` is served whole through backpressure |
-| TR-1 | t14; t9 | Device timer correctness remains mechanised. The network-observed closures in t9/t14 are robustness checks, not performance expectations. t14 adjudicates the ± 200 ms. t9 establishes the defense rather than the precision: it drips one header byte per second, so it cannot resolve better than that, and its band is 4,500–7,500 ms. What t9 answers is that the connection is closed at all, that `disconnect_timeout_header` counts it, and that a parallel client stays served meanwhile |
+| BR-14 | `pico_http_http_tests` — `SetBodyOverTheCapAllocatesNothing`, `SetBodyAtTheCapIsCopiedAndClearsARefusal`, `CopiedBodyOverTheCapIsAnswered500`, `ARefusedCopiedBodyIsFreedNotHeld`, `CopiedBodyAtTheCapIsServed` | `set_body` over the cap leaves no buffer allocated and `body_refused` set; a copied body one byte over `MAX_BUFFERED_BODY` yields exactly the fixed `500` head, closes and counts `responses_refused`, and the live heap afterwards does not hold a rejected copied body; one of exactly `MAX_BUFFERED_BODY` is served whole through backpressure |
+| TR-1 | t14; t9 | Device timer correctness remains mechanised. The network-observed closures in t9/t14 are robustness checks, not performance expectations. t14 adjudicates the ± 200 ms. t9 establishes the defence rather than the precision: it drips one header byte per second, so it cannot resolve better than that, and its band is 4,500–7,500 ms. What t9 answers is that the connection is closed at all, that `disconnect_timeout_header` counts it, and that a parallel client stays served meanwhile |
 | TR-2 | `pico_http_http_tests` — `BodyProgressTimeoutFiresWithinItsBand`, `BodyProgressTimeoutClosesStalledUpload` | Open at 4,800 ms and closed by 5,200 ms without body progress, counted as `disconnect_timeout_body`. Host-side only: t14 measures the idle and header timeouts, the two observable from a client, and reaches neither this one nor TR-4 or TR-5 |
 | TR-3 | t14, t6 | Device timer correctness and network-observed idle closure remain mechanised robustness checks. Idle close at configured value ± 200 ms |
 | TR-4 | `pico_http_http_tests` — `WriteStallTimeoutFiresWithinItsBand`; t12 | Device deadline correctness and network-observed reclamation remain mechanised robustness checks. The host case holds the band: open at 9,800 ms and closed by 10,200 ms with no ACK progress, counted as `disconnect_timeout_write`. t12 establishes on device that the write stall fires and the parallel probe stays served; it checks `disconnect_timeout_write >= 1` and not when the timeout landed |
@@ -480,7 +480,7 @@ them; review checks these citations (EN-02.1).
 | NR-7 | `pico_http_http_tests`: `Http11RequiresExactlyOneHost` | HTTP/1.1 missing or duplicate Host fails; HTTP/1.0 needs no Host. |
 | NR-8 | `pico_http_http_tests`: `KnownUriWrongMethodReturns405WithAllow`, `UnknownRouteReturns404` | Known URI with wrong method gives 405 with Allow; unknown URI gives 404. |
 | NR-9 | `pico_http_http_tests`: `HeadIsServedFromGetRouteWithoutBody`, `ExplicitHeadRouteWinsOverGetFallback`, `HeadOnChunkedRouteEmitsHeadersOnlyNoLastChunk` | HEAD suppresses every body and last-chunk; explicit HEAD wins. |
-| NR-10 | `pico_http_http_tests`: `RepeatedHeaderFieldsCombineAsList`, `AddFailsWholeWhenCombinedValueOverflows`, `RepeatedHeaderValueOverflowIs431` | Repeated names combine in arrival order and overflow is refused. |
+| NR-10 | `pico_http_http_tests`: `RepeatedHeaderFieldsCombineAsList`, `AddFailsWholeWhenCombinedValueOverflows`, `RepeatedHeaderValueOverflowIs431` | Repeated names combine in arrival order; overflow leaves stored headers unchanged and the parser returns `431`. |
 | OR-1 | `pico_http_http_tests` (the OR-1 counters cases, `PeerCloseAndTheTimeoutTotalAreCounted`, `LocalAbortIsCountedApartFromAPeerReset`, and the `parse_errors_*` and `disconnect_timeout_*` assertions of the boundary and timeout cases); t8; t13; t7 | Each counter's delta matches the injected events on the host; on device t8 checks `disconnect_peer_reset` under an RST burst, t13 `rx_window_throttle_events` and `rx_overflow_drops`, and t7 `post_init_heap_growth_bytes` |
 | OR-2 | Review of `handle_stats` and `register_routes` in `examples/bench/main.cpp`; device bench stats deltas and resets; `consumer` cases `default` and `p8-rp2350` run `consumer_smoke` | GET /stats reports the counters and POST /stats/reset resets them. Consumer cases prove installed profile linkage, not endpoint schemas. |
 | OR-3 | Device inspection of GET /limits; review of `handle_limits`; `consumer` cases `default` and `p8-rp2350` | JSON reports the compiled limits used by the boundary/timeout cases. The client can fall back when /limits is unavailable, so the complete field set needs review/device inspection. |

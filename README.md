@@ -2,12 +2,11 @@
 
 [![CI](https://github.com/jamesfxley/pico-http/actions/workflows/ci.yml/badge.svg)](https://github.com/jamesfxley/pico-http/actions/workflows/ci.yml)
 
-`pico-http` is a modern C++20 library for building lightweight, robust HTTP
-servers on the Raspberry Pi Pico 2 W. The core is **statically
-allocated**: fixed connection slots, fixed parser/response buffers, and a
-zero-copy transmit ring — no post-init heap growth on the hot paths, no silent
-truncation under load, and hard boundary limits that answer with a real HTTP
-status, except the connection cap, which is refused at the TCP layer.
+pico-http is a C++20 HTTP server for Raspberry Pi Pico 2 W. Fixed connection
+slots, parser buffers and a transmit ring bound its core storage. Boundary
+failures return HTTP errors; the connection cap rejects excess connections at
+TCP level. The [allocation model](docs/architecture.md#allocation) describes
+the bounded copied-body exception.
 
 All public symbols live in `namespace pico_http` with headers under the
 `pico_http/` prefix.
@@ -26,12 +25,12 @@ FetchContent_MakeAvailable(pico_http)
 target_link_libraries(app PRIVATE pico_http::core)
 ```
 
-lwIP requires the application to provide `lwipopts.h`, and
-`PICO_LWIPOPTS_TARGET` **must** name the INTERFACE target carrying yours;
-configuration fails without it. The SDK compiles lwIP into this library, so a
-default would build a second lwIP against a configuration your application does
-not use. `pico_http::lwipopts_fallback` is a reference configuration that
-meets pico-http's requirements, to start yours from.
+Your application provides lwIP’s `lwipopts.h`. `PICO_LWIPOPTS_TARGET` must
+name the INTERFACE target carrying it; configuration fails without that
+target. There is no default because the SDK compiles lwIP into each linking
+target, and differing configurations would produce incompatible copies.
+`pico_http::lwipopts_fallback` is a reference configuration to copy or select
+explicitly.
 
 <!-- example: readme_quick_start -->
 ```cpp
@@ -48,17 +47,13 @@ if (!routed) { /* the method or pattern is too long */ }
 if (!server->start(80)) { /* port bind failed */ }
 ```
 
-Responses can be supplied three ways — copied (`set_body`), a view over static
-memory copied only into the transmit ring (`set_body_static`), or streamed from a resumable generator
-(`set_body_generator`, arbitrarily large responses in bounded RAM). A generator
-given a length produces a `Content-Length` response; the length-less overload
-produces a `Transfer-Encoding: chunked` response (close-delimited for HTTP/1.0
-clients) for bodies whose size is not known up front. `HEAD` is served
-automatically wherever a `GET` route exists. See the
-[usage guide](docs/usage-guide.md).
+Responses use copied, static or generated bodies. A generator with a known
+length uses `Content-Length`; one without a length uses chunked framing for
+HTTP/1.1 or close-delimited framing for HTTP/1.0. `HEAD` uses a registered
+`GET` handler unless a `HEAD` handler is registered. The [usage
+guide](docs/usage-guide.md) covers each mode.
 
-On the host, inject the fake transport instead of lwIP (this is what the test
-suite does — no hardware required):
+Host code injects the fake transport to run without hardware:
 
 <!-- example: readme_host_fake -->
 ```cpp
@@ -78,18 +73,18 @@ server.start(80);
 | `pico_http::util` | `TxRing`, the header-only transmit ring. `FixedString` and the byte accessors are pico-util's |
 | `pico_http::lwipopts_assertions` | What this library requires of the application's `lwipopts.h`. Assertions only; it defines no lwIP option |
 | `pico_http::lwipopts_fallback` | A reference configuration meeting them, to copy or to name in `PICO_LWIPOPTS_TARGET`. Outside the automatic link graph |
-| `pico_http::testing` | `FakeTcpTransport` and `ServiceHarness` — drive the HTTP layer from host tests (deliver bytes, ack sends, inject RSTs, advance time). Exported with the package from a host build; a firmware build exports `tcp_lwip` instead |
+| `pico_http::testing` | `FakeTcpTransport` and `ServiceHarness`: drive the HTTP layer from host tests (deliver bytes, ack sends, inject RSTs, advance time). Exported with the package from a host build; a firmware build exports `tcp_lwip` instead |
 | `pico_http::core` | Umbrella INTERFACE target linking the library targets above |
 
 Product dependency pins for pico-logging and pico-util live in CMakeLists.txt.
 The `infra` submodule supplies the pinned family and House build support.
 Source overrides are explicit; sibling checkouts are not discovered.
 
-## Building & tests
+## Building and tests
 
-Initialize the pinned family and its nested House and standard with
-`git submodule update --init --recursive`. The family supplies the build helpers,
-gates and devcontainer; product revisions are declared in CMakeLists.txt.
+Initialise the pinned dependencies with `git submodule update --init
+--recursive`. The family supplies build helpers, gates and the devcontainer.
+`CMakeLists.txt` declares product revisions.
 
 ```sh
 python3 dev.py check --ci
@@ -104,10 +99,10 @@ commands. Device benchmarks are separate from build and static-footprint checks.
 Host tests are configured only when pico-http is the top-level project and
 not cross-compiling.
 
-`tests/device/` provides four autonomous TCP loopback cases for AR-5, AR-6,
-RR-3 and AR-9. They cover the lwIP glue, bypassing the CYW43 Wi-Fi path; no
-Wi-Fi join or credentials are used by the image. Select its application-owned
-lwIP configuration for the whole firmware build:
+`tests/device/` checks TCP backpressure, receive-window reopening, connection
+capacity and deferred completion over lwIP loopback. It bypasses CYW43 Wi-Fi
+and needs no network join.
+Select its lwIP configuration for the whole firmware build:
 
 ```sh
 HOUSE_MATRIX_PROFILE=default \
@@ -140,70 +135,55 @@ Select one whole-build at configure time:
 cmake -B build-firmware -DPICO_HTTP_PROFILE=p8-rp2350 ...
 ```
 
-The choice feeds the `HttpService` profile, the transport buffer factors, and
-lwipopts together, and static_asserts bind each buffer to the lwipopts value it
-depends on so the two cannot drift; the specification's AR-10 lists every
-requirement on an application's `lwipopts.h`. The definitions are usage
-requirements of `pico_http::config`, so a consumer's own translation units are
-compiled against the same layout as the library it links. Supply a fully custom
-profile by defining `PICO_HTTP_ACTIVE_PROFILE` to a struct satisfying the
-`HttpProfile` concept (see `pico_http/config/profile.hpp`). Header caps are
-independent knobs (`PICO_HTTP_MAX_HEADER_NAME` /
-`PICO_HTTP_MAX_HEADER_VALUE`).
+The profile selection propagates through `pico_http::config` to consumers,
+transport sizes and lwIP options. Compile-time assertions check the bindings.
+The [custom-profile guide](docs/usage-guide.md#a-custom-profile) covers
+replacement profiles. The header caps are set independently with
+`PICO_HTTP_MAX_HEADER_NAME` and `PICO_HTTP_MAX_HEADER_VALUE`
+([specification §3.5](docs/technical-specification.md#35-header-storage-knob)).
 
 ## On-device records
 
-The on-device bench suite covers chunked request decode,
-`Expect: 100-continue`, slowloris/timeout defenses, RST robustness and zero
-post-init heap growth on a Pico 2 W (RP2350). No reference records are committed yet;
-they will live in [examples/bench/baselines/](examples/bench/baselines/)
-(FW-4). Some tests record numbers without a verdict;
-[examples/bench/baselines/README.md](examples/bench/baselines/README.md) names
-them, and "green" is a claim about the tests that adjudicate.
+The device suite covers request framing, timeouts, resets and allocation on
+Pico 2 W. The [baseline guide](examples/bench/baselines/README.md) explains
+which results decide a verdict and which are recorded for review. Reference
+records are deferred; see [future work](docs/future-work.md).
 
-- **Supported target: Pico 2 W (RP2350).** The Pico W (RP2040) is refused at
-  configure: pico-logging's atomics are not lock-free on its ARMv6-M core
-  (FW-1).
-- **Copied-body allocation is bounded, not zero** — a copied `set_body` holds
-  its body in the connection slot until sent, and one over `MAX_BUFFERED_BODY`
-  is answered `500` instead; static and generator bodies allocate zero. The
-  bound is AR-1's, with BR-14.
-- **Second-core handler execution and server-side TLS** are outside the supported surface (FW-2, FW-3).
+Pico W (RP2040), second-core handler execution and server-side TLS are outside
+the supported surface. Their constraints are in [future work](docs/future-work.md).
 
 ## Documentation
 
-- [Documentation index](docs/README.md) — what each document is for
-- [Orientation](docs/orientation.md) — commands, conventions and traps, before
+- [Documentation index](docs/README.md): what each document is for
+- [Orientation](docs/orientation.md): commands, conventions and traps, before
   a first change
-- [Contributing](CONTRIBUTING.md)
-  — how a change is proposed, and what the gates ask of it
-- [Technical specification](docs/technical-specification.md) — normative;
+- [Contributing](CONTRIBUTING.md): how a change is proposed, and what the gates
+  ask of it
+- [Technical specification](docs/technical-specification.md): normative;
   requirement IDs `AR/PR/RR/BR/TR/NR/OR`, their pass criteria and the
   traceability matrix
-- [Architecture](docs/architecture.md) — how the stack works: connection
+- [Architecture](docs/architecture.md): how the stack works: connection
   slots, RX/TX paths, backpressure, timeouts, observability
-- [Usage guide](docs/usage-guide.md) — routes, body modes,
+- [Usage guide](docs/usage-guide.md): routes, body modes,
   configuration, host testing
-- [Benchmark suite](examples/bench/README.md) — on-device endpoint
+- [Benchmark suite](examples/bench/README.md): on-device endpoint
   contract and `bench.py` results
-- [Standing deviations](docs/deviations.md) — scope-wide rule suppressions and
+- [Standing deviations](docs/deviations.md): scope-wide rule suppressions and
   their review dates
-- [Releases](https://github.com/jamesfxley/pico-http/releases) — what changed per
+- [Releases](https://github.com/jamesfxley/pico-http/releases): what changed per
   release, and what to change in your code when an API broke
 
 ## Releases
 
-Versioning is semver: a breaking change lands at a minor bump while the major
-version is 0, and at a major bump from 1.0. The notes on
-each [release](https://github.com/jamesfxley/pico-http/releases) record what
-changed and, for a break, what to change in your own code (`EN-06.3`).
+Public API compatibility and release notes follow [EN-06.1 and
+EN-06.3](infra/house/standard/engineering/06-release-and-versioning.md).
+[Releases](https://github.com/jamesfxley/pico-http/releases) include migration
+steps.
 
 ## AI-assisted development
 
-This project is developed with AI assistance. Design decisions, review and
-acceptance are human; an AI agent writes and refactors code under direction and
-against a written engineering standard. Every change passes the repository's own
-gates — build, tests, formatter, linter, deviation counts — before it lands.
+This project is developed with AI assistance. People direct design, review and
+acceptance; agents write and refactor code against the engineering standard.
+Changes pass the repository gates before merging.
 
-This section is disclosure, not a warranty. The terms in [LICENSE](LICENSE)
-apply unchanged, including its disclaimer of warranties.
+The terms in [LICENSE](LICENSE) apply, including its disclaimer of warranties.
