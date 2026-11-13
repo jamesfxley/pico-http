@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-// AR-10: this consumer owns the configuration name; values come from the
-// package.
+// The consumer owns the configuration name. The package supplies its values
+// (AR-10).
 #include "lwipopts_reference.h"

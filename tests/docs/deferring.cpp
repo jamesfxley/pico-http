@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Deferring a response, given the reader's own sensor state.
 #include <pico_http/pico_http.hpp>
 #include <string_view>
 

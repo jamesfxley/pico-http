@@ -6,17 +6,10 @@
 
 #include "pico_http/http/http_parser.hpp"
 
-/// libFuzzer entry point for the incremental HTTP request parser.
-/// Built only when PICO_HTTP_ENABLE_FUZZERS is set and the compiler supports
-/// -fsanitize=fuzzer (Clang). The always-on corpus in http_parser_test.cpp
-/// exercises the same contract in CI; this target explores it continuously.
-///
-/// The parser must, for any byte sequence: terminate, never consume more than
-/// it was given, and never stall (consume zero bytes while still Incomplete on
-/// non-empty input). Sanitizers catch any memory misuse; the asserts below
-/// catch contract violations.
+/// For any input, the parser must terminate, consume no more than supplied
+/// and make progress on non-empty incomplete input.
 
-// Entry-point name fixed by libFuzzer's ABI.
+// readability-identifier-naming: libFuzzer fixes the entry-point name.
 // NOLINTNEXTLINE(readability-identifier-naming)
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data,
                                       std::size_t size) {
@@ -34,20 +27,14 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data,
             __builtin_trap();  // over-consumed
         }
         off += consumed;
-        // Checked before the verdict is dispatched, so it holds on every
-        // iteration rather than only the INCOMPLETE ones. That is the
-        // termination argument: each pass consumes at least one byte, so the
-        // loop is bounded by input.size(). A separate iteration cap phrased as
-        // `> input.size() + 8` cannot fire once this trap is above it, and a
-        // guarantee that cannot fail is not one.
+        // Progress is checked before dispatching any verdict, bounding
+        // iterations by input size.
         if (consumed == 0) {
             __builtin_trap();  // stalled
         }
         if (status == pico_http::ParseResult::COMPLETE) {
-            // feed() leaves trailing bytes for the next request, so a corpus
-            // entry beginning with a well-formed request has more to explore.
-            // Breaking here left every byte past the first request boundary
-            // unparsed, and the reset/pipelining path unfuzzed entirely.
+            // Resetting rather than breaking also parses the bytes after the
+            // first complete request.
             parser.reset();
             continue;
         }

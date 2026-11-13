@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// The length-less generator, given a response and the reader's generator.
 #include <cstddef>
 #include <cstdint>
 #include <pico_http/pico_http.hpp>

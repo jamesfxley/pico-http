@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Observability, given the server; the example reads values it then ignores.
 #include <cstddef>
 #include <pico_http/pico_http.hpp>
 

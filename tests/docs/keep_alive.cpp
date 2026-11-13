@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Keep-alive and timeouts, given the server.
 #include <pico_http/pico_http.hpp>
 
 namespace doc_examples {

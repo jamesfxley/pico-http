@@ -10,9 +10,8 @@ house_cxx_add_module_test(pico_http http
     LIBRARIES pico_http::testing pico_util::heap pico_util::testing
 )
 
-# libFuzzer targets: the parser in isolation, and the full request lifecycle
-# (parse -> dispatch -> streamed response) over FakeTcpTransport. The corpus in
-# http_parser_test.cpp keeps the same invariants under continuous CI coverage.
+# The fixed parser corpus runs in CI. libFuzzer explores generated input for
+# the parser and service.
 house_cxx_add_fuzzer(pico_http_parser_fuzz
     PACKAGE pico_http
     SOURCE http_parser_fuzz.cpp

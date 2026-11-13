@@ -12,10 +12,8 @@
 #include "pico_http/tcp/transport_base.hpp"
 
 /// \file porting_example_test.cpp
-/// Compiles the custom-transport and custom-profile examples printed in
-/// docs/usage-guide.md ("Porting"), so the documented extension points
-/// cannot drift from the interfaces they describe. If this file needs an edit
-/// to build, that section of the guide needs the same edit.
+/// This copies the transport and profile examples in docs/usage-guide.md,
+/// Porting. An edit here needs the same edit there.
 
 namespace {
 
@@ -81,8 +79,7 @@ TEST(PortingExampleTest, DocumentedTransportSatisfiesTheInterface) {
     EXPECT_TRUE(transport.listen(80));
     EXPECT_EQ(transport.port(), 80);
 
-    // The base supplies the rest of ITcpTransport, so a derived transport that
-    // implements only the documented hooks is a complete, usable one.
+    // The base supplies every ITcpTransport member beyond these hooks.
     pico_http::ITcpTransport& as_interface = transport;
     EXPECT_FALSE(as_interface.is_open(pico_http::tcp::ConnectionId{}));
     as_interface.close_server();

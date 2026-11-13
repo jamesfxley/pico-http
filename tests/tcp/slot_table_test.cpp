@@ -52,12 +52,11 @@ TEST(SlotTableTest, ReleaseFreesCapacityAndIsIdempotent) {
     const ConnectionId first = table.acquire();
     EXPECT_TRUE(table.release(first));
     EXPECT_EQ(table.active_count(), 0U);
-    // Second release of the same (now stale) id is a no-op, not a fault.
     EXPECT_FALSE(table.release(first));
 }
 
 TEST(SlotTableTest, StaleHandleAfterReuseDoesNotResolve) {
-    // The core ABA guarantee (AR-4): reusing a slot invalidates old handles.
+    // Reuse invalidates the previous handle (AR-4).
     SlotTable<Payload, 1> table;
     const ConnectionId first = table.acquire();
     Payload* first_slot = table.get(first);
@@ -65,27 +64,24 @@ TEST(SlotTableTest, StaleHandleAfterReuseDoesNotResolve) {
     first_slot->value = 111;
     table.release(first);
 
-    const ConnectionId second =
-        table.acquire();  // same physical slot, new generation
+    const ConnectionId second = table.acquire();
     ASSERT_TRUE(second.valid());
     EXPECT_EQ(second.slot(), first.slot());
     EXPECT_NE(second, first);
 
-    EXPECT_EQ(table.get(first), nullptr);   // stale handle inert
-    ASSERT_NE(table.get(second), nullptr);  // fresh handle live
-    // Resolving through the fresh id reaches the (reused) slot; the payload is
-    // deliberately not cleared on reuse — the caller reinitialises it.
+    EXPECT_EQ(table.get(first), nullptr);
+    // The caller reinitialises the payload on reuse.
+    ASSERT_NE(table.get(second), nullptr);
     Payload* reused = table.get(second);
     ASSERT_NE(reused, nullptr);
     reused->value = 222;
-    EXPECT_EQ(table.get(first), nullptr);  // still inert after the write
+    EXPECT_EQ(table.get(first), nullptr);
 }
 
 TEST(SlotTableTest, GenerationNeverIssuesZeroAcrossTheWrap) {
-    // 70000 > 65535 forces the 16-bit generation to wrap. It must skip 0 so no
-    // live id ever encodes to the invalid sentinel. (Within one 65535-reuse
-    // window an old id stays inert; aliasing after a full wrap is the
-    // documented ABA bound, not tested here.)
+    // The 70,000 reuses force a 16-bit wrap. Generation must skip zero so no
+    // live id equals the invalid sentinel. Aliasing after a full wrap is
+    // outside this check.
     SlotTable<Payload, 1> table;
     for (int i = 0; i < 70000; ++i) {
         const ConnectionId id = table.acquire();
@@ -103,7 +99,7 @@ TEST(SlotTableTest, HighWatermarkTracksPeakOccupancy) {
     const ConnectionId third = table.acquire();
     table.release(second);
     EXPECT_EQ(table.active_count(), 2U);
-    EXPECT_EQ(table.high_watermark(), 3U);  // peak, not current
+    EXPECT_EQ(table.high_watermark(), 3U);
     (void)first;
     (void)third;
 }
@@ -129,7 +125,6 @@ TEST(SlotTableTest, ForEachActiveVisitsOnlyLiveSlots) {
         EXPECT_TRUE(id.valid());
         seen.push_back(payload.value);
     });
-    // b was released; only a and c remain.
     EXPECT_EQ(seen.size(), 2U);
 }
 

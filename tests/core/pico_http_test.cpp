@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Compiles the umbrella header as a translation unit so the full public surface
-// is exercised by the analysis toolchain, and pins the advertised version to
-// the values the build system carries.
+// The umbrella header is checked by the analysis toolchain.
 #include "pico_http/pico_http.hpp"
 
 #include <gtest/gtest.h>

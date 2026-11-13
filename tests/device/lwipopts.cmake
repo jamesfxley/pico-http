@@ -1,12 +1,10 @@
-# The device image is the application owning this whole-build lwIP configuration
-# (AR-10). Keep its options off the fallback target and out of installed usage.
+# The device image owns this whole-build configuration (AR-10).
 add_library(pico_http_device_lwipopts INTERFACE)
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/device-lwipopts/lwipopts.h
     "#pragma once\n#include <lwipopts_reference.h> // IWYU pragma: export\n"
     "#undef MEMP_NUM_TCP_PCB\n#define MEMP_NUM_TCP_PCB 24\n"
-    # Idle loopback peers need extra PCBs, not twice the simultaneous TX load.
-    # Keep the reference's heap, segment and ROM-header budgets for eight
-    # transmitting application slots; the peer tests serialize their writes.
+    # Idle loopback peers need extra PCBs. Serial writes retain the reference
+    # TX budgets for eight application slots.
     "#undef MEM_SIZE\n#define MEM_SIZE (12 * ((TCP_SND_QUEUELEN / 2) * PICO_HTTP_REF_TCP_HEADER_BYTES + TCP_MSS + PICO_HTTP_REF_TCP_HEADER_BYTES) + 2048)\n"
     "#undef MEMP_NUM_TCP_SEG\n#define MEMP_NUM_TCP_SEG (12 * (TCP_SEGMENTS_PER_CONN + 8))\n"
     "#undef MEMP_NUM_PBUF\n#define MEMP_NUM_PBUF (12 * TCP_SND_QUEUELEN)\n")

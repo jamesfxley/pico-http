@@ -26,25 +26,20 @@ using pico_http::ParseResult;
 namespace {
 
 std::span<const std::uint8_t> bytes_of(std::string_view text) {
-    // Viewing the same bytes through the unsigned char type the parser
-    // takes. unsigned char may alias; the required bit_cast diagnostic
-    // is suppressed at this test-site conversion.
+    // unsigned char may alias the input bytes.
+    // bugprone-bitwise-pointer-cast: byte views preserve representation.
     // NOLINTNEXTLINE(bugprone-bitwise-pointer-cast)
     return {std::bit_cast<const std::uint8_t*>(text.data()), text.size()};
 }
 
-// Feed the whole request in one shot.
 template <typename Limits = DefaultHttpLimits>
 ParseResult parse_all(HttpParser<Limits>& parser, std::string_view request,
                       std::size_t& consumed) {
     return parser.feed(bytes_of(request), consumed);
 }
 
-// Everything a parse produces, so segmentation equivalence is asserted on the
-// parser's *output* and not merely on its verdict enum. These fields are the
-// state that survives a feed() boundary -- scratch_ accumulating a token,
-// body_len_ indexing the body -- so a defect in exactly that state is what
-// comparing only the enum cannot see.
+// Comparing parsed fields catches corrupted cross-call state even when
+// verdicts agree.
 struct ParseOutcome {
     ParseResult status = ParseResult::INCOMPLETE;
     std::size_t consumed = 0;
@@ -85,7 +80,6 @@ ParseOutcome snapshot(const HttpParser<Limits>& parser, ParseResult status,
     return outcome;
 }
 
-// The whole request in one feed().
 template <typename Limits = DefaultHttpLimits>
 ParseOutcome parse_whole(std::string_view request) {
     HttpParser<Limits> parser;
@@ -94,7 +88,6 @@ ParseOutcome parse_whole(std::string_view request) {
     return snapshot(parser, status, consumed);
 }
 
-// Cut once at `split`, then the remainder.
 template <typename Limits = DefaultHttpLimits>
 ParseOutcome parse_split(std::string_view request, std::size_t split) {
     HttpParser<Limits> parser;
@@ -111,7 +104,6 @@ ParseOutcome parse_split(std::string_view request, std::size_t split) {
     return snapshot(parser, status, off);
 }
 
-// One byte per feed() -- the finest segmentation there is.
 template <typename Limits = DefaultHttpLimits>
 ParseOutcome parse_per_byte(std::string_view request) {
     HttpParser<Limits> parser;
@@ -129,10 +121,8 @@ ParseOutcome parse_per_byte(std::string_view request) {
     return snapshot(parser, status, off);
 }
 
-// EN-04.5. Segmentation is chosen by the network, so every cut of the same
-// bytes must produce the same outcome -- the verdict, the bytes consumed and
-// every parsed field. Asserting the verdict alone leaves the cross-call state
-// unchecked, and that state is the only thing segmentation exercises.
+// Every segmentation must preserve verdict, consumed length and parsed
+// fields.
 template <typename Limits = DefaultHttpLimits>
 void expect_segmentation_independent(std::string_view request) {
     const ParseOutcome expected = parse_whole<Limits>(request);
@@ -181,9 +171,6 @@ TEST(HttpParserTest, TrimsHeaderOptionalWhitespace) {
 }
 
 TEST(HttpParserTest, AFullLengthHeaderValueIsAcceptedAndStoredWhole) {
-    // The advertised cap is the enforced cap: MAX_HEADER_LINE is derived from
-    // the storage caps, so a full-length name and a full-length value fit on
-    // one line instead of being rejected at 431 by a shorter line limit.
     HttpParser<> parser;
     const std::string name(pico_http::HTTPHeaders::MAX_HEADER_NAME, 'N');
     const std::string value(pico_http::HTTPHeaders::MAX_HEADER_VALUE, 'v');
@@ -220,9 +207,6 @@ TEST(HttpParserTest, IncompleteWhenHeadUnterminated) {
 }
 
 TEST(HttpParserTest, SegmentationIndependenceAcrossEverySplit) {
-    // The parser's defining property: identical verdict no matter
-    // where the byte stream is cut. Exhaustively splits at every offset plus
-    // the one-byte-at-a-time extreme.
     const std::vector<std::string> requests = {
         "GET /a HTTP/1.1\r\nHost: h\r\n\r\n",
         "POST /b HTTP/1.0\r\nContent-Length: 4\r\nX: y\r\n\r\ndata",
@@ -253,7 +237,7 @@ TEST(HttpParserTest, PipeliningLeavesTrailingBytesForNextRequest) {
     EXPECT_EQ(parser.uri(), "/2");
 }
 
-// --- Boundary + conformance matrix (BR-1..9, NR-1/NR-3) ---------------------
+// Boundary and conformance cases (BR-1..9, NR-1/NR-3).
 
 namespace {
 struct TinyLimits {
@@ -267,31 +251,19 @@ struct TinyLimits {
     static constexpr std::size_t MAX_BUFFERED_BODY = 16;
 };
 
-// As TinyLimits, but with the head and line caps raised so that the header
-// *count* is the limit reached first. Without this the head cap bites and a
-// test named for the count would be measuring something else.
+// Raised head and line caps let the header-count limit fail first.
 struct LooseHeadLimits {
     static constexpr std::size_t MAX_REQUEST_LINE = 40;
     static constexpr std::size_t MAX_METHOD = 8;
     static constexpr std::size_t MAX_URI = 16;
     static constexpr std::size_t MAX_VERSION = 16;
     static constexpr std::size_t MAX_HEADER_LINE = 64;
-    // MAX_HEADERS is pinned to HTTPHeaders::MAX_HEADERS by a static_assert in
-    // the parser, so only the head and line caps move here.
     static constexpr std::size_t MAX_HEADERS = 16;
     static constexpr std::size_t MAX_REQUEST_HEAD = 512;
     static constexpr std::size_t MAX_BUFFERED_BODY = 16;
 };
 
-// The verdict for `request`, having first established that it is the same
-// verdict -- and the same everything else -- at every segmentation.
-//
-// The check lives here rather than at the call sites because every boundary and
-// conformance case in this file routes through this helper, and those are the
-// branches carrying the most state across a feed() boundary: host_count_,
-// cl_present_, te_present_, chunk_size_has_digit_, overhead_bytes_, rl_bytes_.
-// Feeding each of them exactly once, whole, tested every one at one
-// segmentation and no other.
+// Every boundary and conformance case checks segmentation equivalence.
 template <typename Limits>
 ParseResult verdict(std::string_view request) {
     expect_segmentation_independent<Limits>(request);
@@ -299,14 +271,8 @@ ParseResult verdict(std::string_view request) {
 }
 }  // namespace
 
-// EN-04.4. Every cap below had a test on the "one over" side and none on the
-// cap itself, so an off-by-one that reads as a correction -- `>` where the code
-// says `>=` -- moved the rejection by one byte with nothing to notice. The
-// at-cap case is the contract half: the library advertises these constants over
-// /limits, so "the advertised cap is a usable length" is a promise, not an
-// implementation detail. Each pair below is one below-or-at, one over.
+// At-cap cases detect limits that reject a usable byte too early.
 TEST(HttpParserBoundaryTest, AUriOfExactlyMaxUriIsAccepted) {
-    // 16 characters, the advertised cap.
     const std::string uri = "/" + std::string(TinyLimits::MAX_URI - 1, 'u');
     ASSERT_EQ(uri.size(), TinyLimits::MAX_URI);
     const std::string request = "GET " + uri + " HTTP/1.1\r\nHost: h\r\n\r\n";
@@ -320,20 +286,16 @@ TEST(HttpParserBoundaryTest, AHeaderLineOfExactlyMaxHeaderLineIsAccepted) {
     const std::string value(TinyLimits::MAX_HEADER_LINE - 3, 'v');
     const std::string line = "X: " + value;
     ASSERT_EQ(line.size(), TinyLimits::MAX_HEADER_LINE);
-    // Host is not optional on HTTP/1.1 -- without it the verdict is
-    // BAD_REQUEST for a reason that has nothing to do with the cap under test.
+    // Host prevents a missing-Host 400 from masking the cap check.
     const std::string request =
         "GET / HTTP/1.1\r\nHost: h\r\n" + line + "\r\n\r\n";
 
     EXPECT_EQ(verdict<TinyLimits>(request), ParseResult::COMPLETE);
-    // Entry 0 is Host; entry 1 is the line under test, stored whole.
     EXPECT_EQ(parse_whole<TinyLimits>(request).headers.at(1).second, value);
 }
 
 TEST(HttpParserBoundaryTest, AHeadOfExactlyMaxRequestHeadIsAccepted) {
-    // Filled with short header lines, then one final line sized to land the
-    // head exactly on the cap. Padding a single header instead would exceed
-    // MAX_HEADER_LINE and be rejected for the wrong reason.
+    // Padding one header would exceed MAX_HEADER_LINE before the head cap.
     const std::size_t tail = std::string_view("\r\n").size();
     std::string request = "GET / HTTP/1.1\r\nHost: h\r\n";
     int filler = 0;
@@ -352,38 +314,32 @@ TEST(HttpParserBoundaryTest, AHeadOfExactlyMaxRequestHeadIsAccepted) {
 
     EXPECT_EQ(verdict<TinyLimits>(request), ParseResult::COMPLETE);
 
-    // And one byte more is over: the pair is what pins the comparison.
     const std::string over = request.substr(0, request.size() - tail) + "y\r\n";
     EXPECT_EQ(verdict<TinyLimits>(over), ParseResult::HEADER_FIELDS_TOO_LARGE);
 }
 
 TEST(HttpParserBoundaryTest, ExactlyMaxHeadersAreAccepted) {
     std::string request = "GET / HTTP/1.1\r\n";
-    // Host counts towards the header total, so it is one of the MAX_HEADERS.
     request += "Host: h\r\n";
     for (std::size_t i = 1; i < TinyLimits::MAX_HEADERS; ++i) {
         request += "H" + std::to_string(i) + ": v\r\n";
     }
     request += "\r\n";
 
-    // Head cap would bite first under TinyLimits, so this one uses the default
-    // limits with their own header count.
     using CountLimits = LooseHeadLimits;
     EXPECT_EQ(verdict<CountLimits>(request), ParseResult::COMPLETE);
     EXPECT_EQ(parse_whole<CountLimits>(request).headers.size(),
               CountLimits::MAX_HEADERS);
 }
 
-// MAX_METHOD and MAX_VERSION had no test on either side. Their static_asserts
-// bound them against the scratch buffer, which is a sizing relation rather than
-// a behavioural one: neither says what the parser does with a token of exactly
-// that length, or one byte more.
+// Compile-time sizing assertions do not check token-length rejection
+// boundaries.
 TEST(HttpParserBoundaryTest, AMethodOfExactlyMaxMethodIsParsedNotRejected) {
     const std::string method(TinyLimits::MAX_METHOD, 'M');
     const std::string request = method + " / HTTP/1.1\r\nHost: h\r\n\r\n";
 
-    // Parsed as a token; whether the server implements it is the router's
-    // question, not the parser's, so the verdict must not be BAD_REQUEST.
+    // An unimplemented method token must not produce BAD_REQUEST in the
+    // parser.
     const ParseResult status = verdict<TinyLimits>(request);
     EXPECT_NE(status, ParseResult::BAD_REQUEST);
     EXPECT_EQ(parse_whole<TinyLimits>(request).method, method);
@@ -404,7 +360,6 @@ TEST(HttpParserBoundaryTest, AVersionOneOverMaxVersionIsRejected) {
 }
 
 TEST(HttpParserBoundaryTest, OverlongUriIsUriTooLong) {
-    // URI exceeds TinyLimits::MAX_URI (16).
     EXPECT_EQ(
         verdict<TinyLimits>("GET /this-uri-is-way-too-long HTTP/1.1\r\n\r\n"),
         ParseResult::URI_TOO_LONG);
@@ -417,7 +372,6 @@ TEST(HttpParserBoundaryTest, OverlongHeaderLineIsHeaderFieldsTooLarge) {
 }
 
 TEST(HttpParserBoundaryTest, OverlongHeadIsHeaderFieldsTooLarge) {
-    // Many small headers that together exceed MAX_REQUEST_HEAD (80).
     std::string req = "GET / HTTP/1.1\r\n";
     for (int i = 0; i < 12; ++i) {
         req += "Ab: cd\r\n";
@@ -433,11 +387,6 @@ TEST(HttpParserBoundaryTest, OversizedBodyIsPayloadTooLarge) {
 }
 
 TEST(HttpParserProfileTest, Rp2350ProfileRaisesBufferedBodyCapToEightKiB) {
-    // The P8-RP2350 profile raises MAX_BUFFERED_BODY from the
-    // default 2048 to 8192. A declared length at the cap parses to completion;
-    // one byte over is rejected; and a length the RP2350 cap admits is still
-    // rejected under the default profile — proving the profile is what moved
-    // it.
     const std::string over =
         "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 8193\r\n\r\n";
     EXPECT_EQ(verdict<P8Rp2350HttpLimits>(over),
@@ -451,8 +400,6 @@ TEST(HttpParserProfileTest, Rp2350ProfileRaisesBufferedBodyCapToEightKiB) {
     EXPECT_EQ(parser.feed(bytes_of(at_cap), consumed), ParseResult::COMPLETE);
     EXPECT_EQ(parser.body().size(), 8192U);
 
-    // 4096 is under 8192 but over the default 2048: accepted here, rejected by
-    // the default profile.
     const std::string mid =
         "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 4096\r\n\r\n";
     EXPECT_EQ(verdict<P8Rp2350HttpLimits>(mid), ParseResult::INCOMPLETE);
@@ -460,7 +407,6 @@ TEST(HttpParserProfileTest, Rp2350ProfileRaisesBufferedBodyCapToEightKiB) {
 }
 
 TEST(HttpParserTest, DefaultHeaderCountOverflowIsHeaderFieldsTooLarge) {
-    // HTTPHeaders holds 16 entries; the 17th distinct header overflows -> 431.
     std::string req = "GET / HTTP/1.1\r\n";
     for (int i = 0; i < 20; ++i) {
         req += "H" + std::to_string(i) + ": v\r\n";
@@ -470,15 +416,14 @@ TEST(HttpParserTest, DefaultHeaderCountOverflowIsHeaderFieldsTooLarge) {
               ParseResult::HEADER_FIELDS_TOO_LARGE);
 }
 
-// BR-8: malformed syntax (charset, request-line spacing, header framing,
-// control chars in a field value) is a 400.
+// Malformed syntax returns 400 (BR-8).
 TEST(HttpParserConformanceTest, RejectsMalformedRequestLines) {
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET /only-two-fields\r\n\r\n"),
               ParseResult::BAD_REQUEST);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET  /x HTTP/1.1\r\n\r\n"),
-              ParseResult::BAD_REQUEST);  // double space -> empty URI field
+              ParseResult::BAD_REQUEST);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GE T /x HTTP/1.1\r\n\r\n"),
-              ParseResult::BAD_REQUEST);  // space in method
+              ParseResult::BAD_REQUEST);
 }
 
 TEST(HttpParserConformanceTest, RejectsBareLfInRequestLine) {
@@ -487,9 +432,9 @@ TEST(HttpParserConformanceTest, RejectsBareLfInRequestLine) {
 }
 
 TEST(HttpParserConformanceTest, IgnoresExactlyOneLeadingCrlf) {
-    // RFC 9112 §2.2: ignore at least one empty line before the request-line
-    // (clients commonly emit a stray CRLF after a request body). Exactly one
-    // is tolerated; a second, or a bare LF, is still malformed.
+    // RFC 9112 §2.2 asks servers to ignore at least one empty line before the
+    // request-line. This parser tolerates exactly one CRLF. A second CRLF or a
+    // bare LF is malformed.
     EXPECT_EQ(
         verdict<DefaultHttpLimits>("\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n"),
         ParseResult::COMPLETE);
@@ -501,8 +446,7 @@ TEST(HttpParserConformanceTest, IgnoresExactlyOneLeadingCrlf) {
 }
 
 TEST(HttpParserConformanceTest, LeadingCrlfCountsAsRequestInProgress) {
-    // A consumed leading CRLF means bytes were taken: the connection is
-    // mid-request for timeout purposes, not idle.
+    // A consumed leading CRLF starts request timing.
     HttpParser<> parser;
     std::size_t consumed = 0;
     parser.feed(bytes_of("\r\n"), consumed);
@@ -511,8 +455,8 @@ TEST(HttpParserConformanceTest, LeadingCrlfCountsAsRequestInProgress) {
 }
 
 TEST(HttpParserConformanceTest, TransferEncodingOnHttp10IsBadRequest) {
-    // Transfer-Encoding did not exist in HTTP/1.0; a 1.0 message carrying it
-    // has faulty framing and must be rejected, never decoded (RFC 9112 §6.1).
+    // HTTP/1.0 Transfer-Encoding must be rejected as faulty framing (RFC 9112
+    // §6.1).
     EXPECT_EQ(verdict<DefaultHttpLimits>(
                   "POST /u HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"
                   "3\r\nabc\r\n0\r\n\r\n"),
@@ -520,8 +464,7 @@ TEST(HttpParserConformanceTest, TransferEncodingOnHttp10IsBadRequest) {
 }
 
 TEST(HttpParserConformanceTest, UnknownExpectationIsExpectationFailed) {
-    // The only expectation implemented is 100-continue; silently ignoring any
-    // other would misrepresent the server's behaviour (RFC 9110 §10.1.1).
+    // Unimplemented expectations receive 417 (RFC 9110 §10.1.1).
     EXPECT_EQ(verdict<DefaultHttpLimits>(
                   "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n"
                   "Expect: 200-maybe\r\n\r\nhi"),
@@ -532,11 +475,10 @@ TEST(HttpParserConformanceTest, UnknownExpectationIsExpectationFailed) {
         ParseResult::EXPECTATION_FAILED);
 }
 
-// NR-10: repeated field names combine into one comma-separated value.
+// Repeated field names combine (NR-10).
 TEST(HttpParserConformanceTest, RepeatedHeaderFieldsCombineAsList) {
-    // Repeated field names combine into one comma-separated value (RFC 9110
-    // §5.2). Last-one-wins replacement would let a second Connection line
-    // silently erase an earlier "close".
+    // Replacement would let a second Connection field erase an earlier close
+    // token (RFC 9110 §5.2).
     HttpParser<> parser;
     std::size_t consumed = 0;
     auto status = parse_all(parser,
@@ -550,7 +492,7 @@ TEST(HttpParserConformanceTest, RepeatedHeaderFieldsCombineAsList) {
     EXPECT_EQ(parser.headers().get("Connection"), "close, keep-alive");
 }
 
-// NR-10: each field fits by itself; combining must fail whole with 431.
+// Combining individually valid values must fail whole on overflow (NR-10).
 TEST(HttpParserConformanceTest, RepeatedHeaderValueOverflowIs431) {
     const std::string first(pico_http::HTTPHeaders::MAX_HEADER_VALUE - 4, 'a');
     const std::string request =
@@ -575,14 +517,14 @@ TEST(HttpParserConformanceTest, ContentLengthHygiene) {
         verdict<DefaultHttpLimits>(
             "POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n"
             "\r\nx"),
-        ParseResult::BAD_REQUEST);  // duplicate CL
+        ParseResult::BAD_REQUEST);
     EXPECT_EQ(verdict<DefaultHttpLimits>(
                   "POST / HTTP/1.1\r\nContent-Length: abc\r\n\r\n"),
-              ParseResult::BAD_REQUEST);  // non-numeric CL
+              ParseResult::BAD_REQUEST);
     EXPECT_EQ(
         verdict<DefaultHttpLimits>(
             "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n"),
-        ParseResult::PAYLOAD_TOO_LARGE);  // overflow
+        ParseResult::PAYLOAD_TOO_LARGE);
 }
 
 TEST(HttpParserChunkedTest, DecodesChunkedBody) {
@@ -602,9 +544,8 @@ TEST(HttpParserChunkedTest, DecodesChunkedAcrossEverySplit) {
     const std::string req =
         "POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
         "3\r\nabc\r\n0\r\n\r\n";
-    // The decoded body is the point: CHUNK_DATA appends at body_len_, which is
-    // state carried across the boundary, so a split that lost it would still
-    // report COMPLETE while producing a truncated or overwritten body.
+    // Verdict alone misses a body overwritten or truncated across a feed
+    // boundary.
     const ParseOutcome whole = parse_whole(req);
     ASSERT_EQ(whole.status, ParseResult::COMPLETE);
     ASSERT_EQ(whole.body, "abc");
@@ -612,9 +553,8 @@ TEST(HttpParserChunkedTest, DecodesChunkedAcrossEverySplit) {
 }
 
 TEST(HttpParserChunkedTest, RejectsControlBytesInExtensionsAndTrailers) {
-    // Extensions and trailers are skipped, not parsed, but control octets
-    // (e.g. a bare LF or NUL) are still rejected — the same field-syntax rule
-    // as headers, so nothing can hide framing from a laxer parser downstream.
+    // Skipped extensions and trailers still reject control octets that could
+    // hide framing.
     EXPECT_EQ(
         verdict<DefaultHttpLimits>(
             "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -650,8 +590,8 @@ TEST(HttpParserChunkedTest, RejectsUnsupportedTransferEncoding) {
 }
 
 TEST(HttpParserChunkedTest, OversizedDecodedChunkBodyIsPayloadTooLarge) {
-    // Default buffered-body cap is 2048; a single 0x1000 (4096) byte chunk
-    // overflows it and must be rejected during decode (not silently truncated).
+    // A 0x1000-byte chunk exceeds the default 2048-byte cap and must be
+    // rejected during decoding.
     std::string req =
         "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
     req += "1000\r\n" + std::string(4096, 'a') + "\r\n0\r\n\r\n";
@@ -659,22 +599,19 @@ TEST(HttpParserChunkedTest, OversizedDecodedChunkBodyIsPayloadTooLarge) {
 }
 
 TEST(HttpParserChunkedTest, EmptyChunkSizeLineIsRejectedNotLastChunk) {
-    // RFC 9112 §7.1 requires 1*HEXDIG. A bare CRLF where a chunk size belongs
-    // must not alias the "0" last-chunk: an early terminator would let the
-    // remaining chunk data be reparsed as the next request (a
-    // request-smuggling shape).
+    // A missing size must not become a zero last-chunk and expose body bytes
+    // as a new request (RFC 9112 §7.1).
     EXPECT_EQ(
         verdict<DefaultHttpLimits>(
             "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
             "\r\n\r\n"),
         ParseResult::BAD_REQUEST);
-    // A chunk extension must not stand in for the missing size either.
+    // A chunk extension must not replace a missing size.
     EXPECT_EQ(
         verdict<DefaultHttpLimits>(
             "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
             ";ext=1\r\n\r\n"),
         ParseResult::BAD_REQUEST);
-    // Same rule for every subsequent chunk-size line, not just the first.
     EXPECT_EQ(
         verdict<DefaultHttpLimits>(
             "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -684,23 +621,21 @@ TEST(HttpParserChunkedTest, EmptyChunkSizeLineIsRejectedNotLastChunk) {
 
 TEST(HttpParserTest, InProgressTracksMidRequestWithoutStartedFlag) {
     HttpParser<> parser;
-    EXPECT_FALSE(parser.in_progress());  // fresh parser: idle, not mid-request
+    EXPECT_FALSE(parser.in_progress());
     std::size_t consumed = 0;
     parser.feed(bytes_of("G"), consumed);
-    EXPECT_TRUE(parser.in_progress());  // one method byte taken
+    EXPECT_TRUE(parser.in_progress());
     parser.reset();
-    EXPECT_FALSE(parser.in_progress());  // reset clears it
+    EXPECT_FALSE(parser.in_progress());
     parser.feed(bytes_of("GET /x HTTP/1.1\r\nHost: a\r"), consumed);
-    EXPECT_TRUE(parser.in_progress());  // mid-header
+    EXPECT_TRUE(parser.in_progress());
     parser.feed(bytes_of("\n\r\n"), consumed);
     EXPECT_TRUE(parser.complete());
-    EXPECT_FALSE(parser.in_progress());  // completed: no longer in progress
+    EXPECT_FALSE(parser.in_progress());
 }
 
 TEST(HttpParserChunkedTest, RejectsStackedTransferEncodings) {
-    // Only a lone "chunked" can be framed; any coding stacked with it (which we
-    // cannot decode) must be 501, never decoded as if the extra coding were
-    // absent (BR-9).
+    // An unsupported coding stacked with chunked must produce 501 (BR-9).
     EXPECT_EQ(verdict<DefaultHttpLimits>(
                   "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip, "
                   "chunked\r\n\r\n"),
@@ -709,7 +644,6 @@ TEST(HttpParserChunkedTest, RejectsStackedTransferEncodings) {
                   "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, "
                   "gzip\r\n\r\n"),
               ParseResult::NOT_IMPLEMENTED);
-    // Two Transfer-Encoding headers combine to more than one coding: also 501.
     EXPECT_EQ(verdict<DefaultHttpLimits>(
                   "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n"
                   "Transfer-Encoding: chunked\r\n\r\n"),
@@ -717,9 +651,8 @@ TEST(HttpParserChunkedTest, RejectsStackedTransferEncodings) {
 }
 
 TEST(HttpParserChunkedTest, OverflowingChunkSizeIsRejectedNotWrapped) {
-    // A 17-hex-digit size (2^64) would wrap uint64 to 0 and be misread as the
-    // last chunk, letting the real payload be reparsed as a new request. It
-    // must be rejected instead (request-smuggling defense).
+    // The size 2^64, 17 hexadecimal digits, would wrap uint64_t to zero and
+    // expose the payload as a new request. It must be rejected.
     std::string req =
         "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
     req += "10000000000000000\r\nZZZZ\r\n0\r\n\r\n";
@@ -743,20 +676,17 @@ TEST(HttpParserConformanceTest, ContentLengthPlusTransferEncodingIsBadRequest) {
               ParseResult::BAD_REQUEST);
 }
 
-// --- RFC 9110/9112 compliance matrix (BR-10/11, NR-1/7/8) -------------------
+// HTTP conformance cases (BR-10/11, NR-1/7/8).
 
 TEST(HttpParserConformanceTest, VersionHandling) {
-    // A well-formed HTTP-version the server does not speak is 505, not 400
-    // (RFC 9110 §15.6.6): the request line is valid, the version is the
-    // problem.
+    // A syntactically valid unsupported HTTP version returns 505 (RFC 9110
+    // §15.6.6).
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET /x HTTP/2.0\r\n\r\n"),
               ParseResult::HTTP_VERSION_NOT_SUPPORTED);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET /x HTTP/1.9\r\n\r\n"),
               ParseResult::HTTP_VERSION_NOT_SUPPORTED);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET /x HTTP/9.9\r\n\r\n"),
               ParseResult::HTTP_VERSION_NOT_SUPPORTED);
-    // A token that is not HTTP-version syntax ("HTTP/" DIGIT "." DIGIT) is a
-    // malformed request line -> 400, never 505.
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET /x HTTP/1.11\r\n\r\n"),
               ParseResult::BAD_REQUEST);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET /x HTTP/1.\r\n\r\n"),
@@ -767,44 +697,40 @@ TEST(HttpParserConformanceTest, VersionHandling) {
               ParseResult::BAD_REQUEST);
 }
 
-// NR-7 / BR-10: missing or duplicated Host on HTTP/1.1 is a 400.
+// Host validation (NR-7 / BR-10).
 TEST(HttpParserConformanceTest, Http11RequiresExactlyOneHost) {
-    // RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one Host header.
+    // An HTTP/1.1 request must carry exactly one Host field (RFC 9112 §3.2).
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET / HTTP/1.1\r\nHost: a\r\n\r\n"),
               ParseResult::COMPLETE);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET / HTTP/1.1\r\n\r\n"),
-              ParseResult::BAD_REQUEST);  // missing Host
+              ParseResult::BAD_REQUEST);
     EXPECT_EQ(verdict<DefaultHttpLimits>(
                   "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n"),
-              ParseResult::BAD_REQUEST);  // duplicate Host
-    // HTTP/1.0 has no Host requirement: a missing Host is still a valid
-    // request.
+              ParseResult::BAD_REQUEST);
+    // HTTP/1.0 permits an absent Host field.
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET / HTTP/1.0\r\n\r\n"),
               ParseResult::COMPLETE);
 }
 
 TEST(HttpParserConformanceTest, RejectsControlCharsInFieldValue) {
-    // A field value may hold VCHAR, SP and HTAB — never other controls or DEL
-    // (RFC 9110 §5.5). HTAB stays valid; a C0 control or DEL is rejected.
+    // A field value may contain VCHAR, SP and HTAB, but no other controls or
+    // DEL (RFC 9110 §5.5).
     EXPECT_EQ(verdict<DefaultHttpLimits>(
                   "GET / HTTP/1.1\r\nHost: h\r\nX: a\tb\r\n\r\n"),
-              ParseResult::COMPLETE);  // HTAB is allowed in a value
+              ParseResult::COMPLETE);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET / HTTP/1.1\r\nHost: h\r\nX: a\x01"
                                          "b\r\n\r\n"),
-              ParseResult::BAD_REQUEST);  // C0 control
+              ParseResult::BAD_REQUEST);
     EXPECT_EQ(verdict<DefaultHttpLimits>("GET / HTTP/1.1\r\nHost: h\r\nX: a\x7f"
                                          "b\r\n\r\n"),
-              ParseResult::BAD_REQUEST);  // DEL
+              ParseResult::BAD_REQUEST);
 }
 
-// --- Fuzz-shaped robustness: the parser must always terminate and never stall,
-// crash, or over-consume on hostile input (the libFuzzer target drives the same
-// invariants over generated inputs; this keeps the corpus in CI). ------------
+// The parser must terminate without stalling, crashing or over-consuming
+// hostile input.
 
 namespace {
 
-// Drive the parser over `input`, chopped into small data-dependent chunks to
-// exercise segmentation. Asserts it upholds its contract on any byte sequence.
 void drive_hostile_input(std::span<const std::uint8_t> input) {
     HttpParser<DefaultHttpLimits> parser;
     std::size_t off = 0;
@@ -816,24 +742,22 @@ void drive_hostile_input(std::span<const std::uint8_t> input) {
             parser.feed(input.subspan(off, chunk), consumed);
         ASSERT_LE(consumed, chunk);
         off += consumed;
-        // Above the verdict dispatch, so progress is required on every pass.
-        // That bounds the loop by input.size() on its own; the iteration cap
-        // this replaces sat below the stall check and so could never fire.
+        // Progress is checked before every verdict, bounding the loop by
+        // input size.
         ASSERT_GT(consumed, 0U) << "parser stalled without consuming input";
         if (status == ParseResult::COMPLETE) {
             parser.reset();
-            continue;  // trailing bytes belong to the next request
+            continue;
         }
         if (status != ParseResult::INCOMPLETE) {
-            return;  // a definite failure ends the connection
+            return;
         }
     }
 }
 
 std::span<const std::uint8_t> raw(std::string_view text) {
-    // Viewing the same bytes through the unsigned char type the parser
-    // takes. unsigned char may alias; the required bit_cast diagnostic
-    // is suppressed at this test-site conversion.
+    // unsigned char may alias the input bytes.
+    // bugprone-bitwise-pointer-cast: byte views preserve representation.
     // NOLINTNEXTLINE(bugprone-bitwise-pointer-cast)
     return {std::bit_cast<const std::uint8_t*>(text.data()), text.size()};
 }
@@ -850,15 +774,15 @@ TEST(HttpParserFuzzCorpus, HostileInputsTerminateSafely) {
         "GET / ",
         "GET / HTTP/1.1",
         "GET / HTTP/1.1\r\n",
-        std::string("GET /\0x HTTP/1.1\r\n\r\n", 20),  // embedded NUL
-        "GET / HTTP/1.1\r\nX\x01: \x7f\r\n\r\n",       // CTL bytes
-        "\xff\xfe\xfd\xfc",                            // high bytes
-        std::string(5000, 'A'),                        // huge token
+        std::string("GET /\0x HTTP/1.1\r\n\r\n", 20),
+        "GET / HTTP/1.1\r\nX\x01: \x7f\r\n\r\n",
+        "\xff\xfe\xfd\xfc",
+        std::string(5000, 'A'),
         "GET / HTTP/1.1\r\n" + std::string(5000, 'H') + ": v\r\n\r\n",
-        "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab",  // truncated body
+        "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nab",
         "POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n",
-        // One sample, split by the formatter at the column limit — the
-        // implicit concatenation is intended.
+        // bugprone-suspicious-missing-comma: adjacent literals form one
+        // corpus sample.
         // NOLINTNEXTLINE(bugprone-suspicious-missing-comma)
         "POST / HTTP/1.1\r\nTransfer-Encoding: "
         "chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
@@ -867,7 +791,7 @@ TEST(HttpParserFuzzCorpus, HostileInputsTerminateSafely) {
         ":::::\r\n\r\n",
         "GET  //  HTTP/1.1\r\n\r\n",
         "\n\n\n\n",
-        "\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",  // leading CRLF prelude
+        "\r\nGET / HTTP/1.1\r\nHost: h\r\n\r\n",
         "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
         "POST / HTTP/1.1\r\nHost: h\r\nExpect: never\r\n\r\n",
         "GET / HTTP/1.1\r\nHost: h\r\nHost: h\r\nA: 1\r\nA: 2\r\n\r\n",

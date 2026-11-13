@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// AR-12: the installed firmware surface links after SDK initialization.
+// The installed firmware links after SDK initialisation (AR-12).
 #include "pico_http/http/default_service.hpp"
 
 int main() {

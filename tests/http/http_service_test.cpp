@@ -62,7 +62,7 @@ TEST(HttpServiceTest, UnknownRouteReturns404) {
     EXPECT_TRUE(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
 }
 
-// NR-8: a URI registered under other methods answers 405 + Allow, not 404.
+// A URI registered under another method returns 405 (NR-8).
 TEST(HttpServiceTest, KnownUriWrongMethodReturns405WithAllow) {
     Harness harness;
     auto ok = [](const HTTPRequestView&, HTTPResponse& res) {
@@ -72,8 +72,8 @@ TEST(HttpServiceTest, KnownUriWrongMethodReturns405WithAllow) {
     EXPECT_TRUE(harness.service->add_route("GET", "/thing", ok));
     EXPECT_TRUE(harness.service->add_route("PUT", "/thing", ok));
     const ConnectionId id = harness.wire->connect();
-    // DELETE is not registered for /thing, but GET and PUT are: 405 with an
-    // Allow header listing the methods that are (RFC 9110 §15.5.6).
+    // Allow lists GET and PUT for the unregistered DELETE method (RFC 9110
+    // §15.5.6).
     const std::string response =
         round_trip(harness, id, "DELETE /thing HTTP/1.1\r\nHost: h\r\n\r\n");
     EXPECT_TRUE(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
@@ -85,7 +85,7 @@ TEST(HttpServiceTest, KnownUriWrongMethodReturns405WithAllow) {
     EXPECT_NE(allow_line.find("PUT"), std::string::npos);
 }
 
-// NR-8: wildcard routes count towards the Allow list.
+// Wildcard routes contribute to Allow (NR-8).
 TEST(HttpServiceTest, WildcardRouteContributesToAllowOn405) {
     Harness harness;
     EXPECT_TRUE(harness.service->add_route(
@@ -102,13 +102,12 @@ TEST(HttpServiceTest, WildcardRouteContributesToAllowOn405) {
 
 TEST(HttpServiceTest, AllowListsEveryMethodWithoutTruncation) {
     Harness harness;
-    // The worst case the Allow buffer is sized for: the maximum method count,
-    // each token at the 15-char storage limit. Every token must appear in full.
+    // Every method token must fit in full at the maximum count and length.
     constexpr int METHOD_COUNT = 8;
     std::vector<std::string> methods;
     methods.reserve(METHOD_COUNT);
     for (int i = 0; i < METHOD_COUNT; ++i) {
-        methods.push_back("CUSTOMMETHODM0" + std::to_string(i));  // 15 chars
+        methods.push_back("CUSTOMMETHODM0" + std::to_string(i));
     }
     for (const std::string& method : methods) {
         EXPECT_TRUE(harness.service->add_route(
@@ -127,7 +126,7 @@ TEST(HttpServiceTest, AllowListsEveryMethodWithoutTruncation) {
     }
 }
 
-// --- HEAD (RFC 9110 §9.1: supported wherever GET is) -------------------------
+// HEAD support follows GET support (RFC 9110 §9.1).
 
 TEST(HttpServiceTest, HeadIsServedFromGetRouteWithoutBody) {
     Harness harness;
@@ -140,15 +139,15 @@ TEST(HttpServiceTest, HeadIsServedFromGetRouteWithoutBody) {
     const std::string response =
         round_trip(harness, id, "HEAD /page HTTP/1.1\r\nHost: h\r\n\r\n");
 
-    // Header section exactly as GET would produce — including the GET body's
-    // Content-Length — but no body bytes follow.
+    // The Content-Length describes GET's body despite HEAD sending no body
+    // bytes.
     EXPECT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
     EXPECT_NE(response.find("Content-Length: 9\r\n"), std::string::npos);
     EXPECT_TRUE(response.ends_with("\r\n\r\n"));
     ASSERT_TRUE(
-        harness.wire->is_open(id));  // framing intact: keep-alive survives
+        // Incorrect HEAD framing would corrupt the next response.
+        harness.wire->is_open(id));
 
-    // The connection is reusable: a GET on the same socket parses cleanly.
     const std::string all =
         round_trip(harness, id, "GET /page HTTP/1.1\r\nHost: h\r\n\r\n");
     EXPECT_TRUE(all.ends_with("page body"));
@@ -170,7 +169,7 @@ TEST(HttpServiceTest, ExplicitHeadRouteWinsOverGetFallback) {
     const std::string response =
         round_trip(harness, id, "HEAD /r HTTP/1.1\r\nHost: h\r\n\r\n");
     EXPECT_NE(response.find("X-Head: 1\r\n"), std::string::npos);
-    EXPECT_TRUE(response.ends_with("\r\n\r\n"));  // still no body
+    EXPECT_TRUE(response.ends_with("\r\n\r\n"));
 }
 
 TEST(HttpServiceTest, HeadOnChunkedRouteEmitsHeadersOnlyNoLastChunk) {
@@ -187,8 +186,7 @@ TEST(HttpServiceTest, HeadOnChunkedRouteEmitsHeadersOnlyNoLastChunk) {
     const ConnectionId id = harness.wire->connect();
     const std::string response =
         round_trip(harness, id, "HEAD /stream HTTP/1.1\r\nHost: h\r\n\r\n");
-    // Framing header as GET would send, but neither chunks nor the last-chunk
-    // terminator (RFC 9110 §9.3.2).
+    // HEAD sends neither chunks nor a last-chunk (RFC 9110 §9.3.2).
     EXPECT_NE(response.find("Transfer-Encoding: chunked\r\n"),
               std::string::npos);
     EXPECT_TRUE(response.ends_with("\r\n\r\n"));
@@ -202,7 +200,7 @@ TEST(HttpServiceTest, HeadOnUnroutedUriIs404WithoutBody) {
     const std::string response =
         round_trip(harness, id, "HEAD /missing HTTP/1.1\r\nHost: h\r\n\r\n");
     EXPECT_TRUE(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
-    EXPECT_TRUE(response.ends_with("\r\n\r\n"));  // status + headers only
+    EXPECT_TRUE(response.ends_with("\r\n\r\n"));
 }
 
 TEST(HttpServiceTest, PostBodyIsReadableByHandler) {
@@ -227,7 +225,7 @@ TEST(HttpServiceTest, KeepAliveByDefaultOnHttp11) {
     const std::string response =
         round_trip(harness, id, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
     EXPECT_NE(response.find("Connection: keep-alive\r\n"), std::string::npos);
-    EXPECT_TRUE(harness.wire->is_open(id));  // not closed
+    EXPECT_TRUE(harness.wire->is_open(id));
 }
 
 TEST(HttpServiceTest, ConnectionCloseHeaderClosesSocket) {
@@ -236,7 +234,7 @@ TEST(HttpServiceTest, ConnectionCloseHeaderClosesSocket) {
     const std::string response = round_trip(
         harness, id, "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
     EXPECT_NE(response.find("Connection: close\r\n"), std::string::npos);
-    EXPECT_FALSE(harness.wire->is_open(id));  // closed after send
+    EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_server_closed, 1U);
 }
 
@@ -258,11 +256,11 @@ TEST(HttpServiceTest, KeepAliveRequestCapClosesOnLastAllowed) {
 
     harness.wire->deliver_text(id, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
     harness.flush(id);
-    EXPECT_TRUE(harness.wire->is_open(id));  // first request: stays open
+    EXPECT_TRUE(harness.wire->is_open(id));
 
     harness.wire->deliver_text(id, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
     harness.flush(id);
-    EXPECT_FALSE(harness.wire->is_open(id));  // hit the cap: closed
+    EXPECT_FALSE(harness.wire->is_open(id));
 }
 
 TEST(HttpServiceTest, PipelinedRequestsAnsweredInOrder) {
@@ -277,7 +275,6 @@ TEST(HttpServiceTest, PipelinedRequestsAnsweredInOrder) {
     const std::string response = round_trip(
         harness, id,
         "GET /a HTTP/1.1\r\nHost: h\r\n\r\nGET /a HTTP/1.1\r\nHost: h\r\n\r\n");
-    // Two 200 responses, bodies "1" then "2" -- exactly two, in that order.
     const std::size_t first = response.find("HTTP/1.1 200");
     ASSERT_NE(first, std::string::npos);
     const std::size_t second = response.find("HTTP/1.1 200", first + 1);
@@ -288,8 +285,8 @@ TEST(HttpServiceTest, PipelinedRequestsAnsweredInOrder) {
     EXPECT_TRUE(response.ends_with("2"));
 }
 
-// A body of `size` bytes of 'X' that outlives every response, for the cases
-// that need one larger than a copied body may be (BR-14).
+// The outliving X body supports sizes larger than a copied body may hold
+// (BR-14).
 namespace {
 std::string_view x_body(std::size_t size) {
     static const std::string BODY(200000, 'X');
@@ -297,11 +294,11 @@ std::string_view x_body(std::size_t size) {
 }
 }  // namespace
 
-// --- Large responses stream out without truncation (AR-5) -------------------
+// Streaming across backpressure (AR-5).
 
 TEST(HttpServiceTest, LargeResponseStreamsWithoutTruncationUnderBackpressure) {
     Harness harness(
-        /*send_capacity=*/512);  // tiny transmit buffer forces resumes
+        /*send_capacity=*/512);  // The small buffer forces resumption.
     constexpr std::size_t BODY = 200000;
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/big", [&](const HTTPRequestView&, HTTPResponse& res) {
@@ -315,11 +312,11 @@ TEST(HttpServiceTest, LargeResponseStreamsWithoutTruncationUnderBackpressure) {
     EXPECT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
     EXPECT_NE(response.find("Content-Length: 200000\r\n"), std::string::npos);
     const std::size_t body_start = response.find("\r\n\r\n") + 4;
-    EXPECT_EQ(response.size() - body_start, BODY);  // whole body delivered
+    EXPECT_EQ(response.size() - body_start, BODY);
     EXPECT_GT(harness.service->statistics().backpressure_events, 0U);
 }
 
-// --- Boundary matrix (BR-1..BR-8): violation -> status + Connection: close ---
+// Boundary cases (BR-1..BR-8).
 
 TEST(HttpServiceTest, OversizedContentLengthReturns413) {
     Harness harness;
@@ -384,16 +381,14 @@ TEST(HttpServiceTest, UnsupportedTransferEncodingReturns501) {
 TEST(HttpServiceTest, MalformedRequestLineReturns400) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
-    // Only two fields in the request line — no version token at all.
     const std::string response = round_trip(harness, id, "GET /x\r\n\r\n");
     EXPECT_TRUE(response.starts_with("HTTP/1.1 400"));
 }
 
-// NR-7: an HTTP/1.1 request must carry exactly one Host header.
+// An HTTP/1.1 request must carry exactly one Host field (NR-7).
 TEST(HttpServiceTest, Http11WithoutHostReturns400) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
-    // No Host header on an HTTP/1.1 request (RFC 9112 §3.2).
     const std::string response =
         round_trip(harness, id, "GET / HTTP/1.1\r\n\r\n");
     EXPECT_TRUE(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
@@ -402,18 +397,18 @@ TEST(HttpServiceTest, Http11WithoutHostReturns400) {
 TEST(HttpServiceTest, UnsupportedHttpVersionReturns505) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
-    // Well-formed HTTP-version syntax the server does not speak (RFC 9110
-    // §15.6.6): 505, not 400.
+    // A syntactically valid unsupported version returns 505 (RFC 9110
+    // §15.6.6).
     const std::string response =
         round_trip(harness, id, "GET /x HTTP/2.0\r\n\r\n");
     EXPECT_TRUE(
         response.starts_with("HTTP/1.1 505 HTTP Version Not Supported"));
 }
 
-// --- Teardown accounting (AR-4/RR-1 at the service layer) --------------------
+// Service teardown accounting (AR-4/RR-1).
 
-// OR-1: a peer FIN counts as peer_closed, and every timeout reason also adds
-// to the timeout total.
+// Timeouts contribute to their reason count and total. FIN counts as
+// peer_closed (OR-1).
 TEST(HttpServiceTest, PeerCloseAndTheTimeoutTotalAreCounted) {
     Harness harness;
     const ConnectionId closed = harness.wire->connect();
@@ -422,15 +417,14 @@ TEST(HttpServiceTest, PeerCloseAndTheTimeoutTotalAreCounted) {
 
     const ConnectionId stalled = harness.wire->connect();
     harness.wire->deliver_text(stalled, "G");
-    harness.wire->advance_time(6000);  // past the 5 s header window
+    harness.wire->advance_time(6000);
     ASSERT_FALSE(harness.wire->is_open(stalled));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_header, 1U);
     EXPECT_EQ(harness.service->statistics().disconnect_timeout, 1U);
     EXPECT_EQ(harness.service->statistics().disconnect_peer_closed, 1U);
 }
 
-// OR-1: a local abort is a fault of this side, so it has its own counter and
-// is never folded into the peer's reset count.
+// Local aborts have a separate count from peer resets (OR-1).
 TEST(HttpServiceTest, LocalAbortIsCountedApartFromAPeerReset) {
     Harness harness;
     const ConnectionId aborted = harness.wire->connect();
@@ -451,7 +445,6 @@ TEST(HttpServiceTest, PeerResetFreesSlotAndCountsReason) {
     harness.wire->reset_peer(id);
     EXPECT_EQ(harness.service->statistics().disconnect_peer_reset, 1U);
 
-    // The slot is reusable immediately: fill all connections afterwards.
     for (std::size_t i = 0; i < FakeTcpTransport::MAX_CLIENTS; ++i) {
         EXPECT_TRUE(harness.wire->connect().valid());
     }
@@ -486,10 +479,10 @@ TEST(HttpServiceTest, StatisticsTrackAcceptsAndRequests) {
     EXPECT_EQ(stats.requests_completed, 1U);
     EXPECT_EQ(stats.slot_high_watermark, 1U);
     EXPECT_GT(stats.bytes_out, 0U);
-    EXPECT_GT(stats.bytes_in, 0U);  // request head counted inbound
+    EXPECT_GT(stats.bytes_in, 0U);
 }
 
-// --- Static and generator body modes (AR-2, AR-5) ---------------------------
+// Static and generated response bodies (AR-2, AR-5).
 
 TEST(HttpServiceTest, StaticBodyIsServed) {
     Harness harness;
@@ -508,9 +501,7 @@ TEST(HttpServiceTest, StaticBodyIsServed) {
     EXPECT_TRUE(response.ends_with(PAGE));
 }
 
-// A resumable generator: byte i of the body is (i % 251), a nontrivial pattern
-// that catches offset/resume bugs. The writer owns the position, so the same
-// function serves the whole body across many backpressured resumes.
+// The byte-offset pattern catches incorrect resumption.
 namespace {
 std::size_t pattern_generator(void* /*ctx*/, std::size_t offset,
                               std::span<std::uint8_t> out) {
@@ -522,8 +513,9 @@ std::size_t pattern_generator(void* /*ctx*/, std::size_t offset,
 }  // namespace
 
 TEST(HttpServiceTest, GeneratorBodyStreamsLargeBodyBitExactUnderBackpressure) {
-    Harness harness(/*send_capacity=*/512);  // tiny buffer: forces many resumes
-    constexpr std::size_t BODY = std::size_t{256} * 1024;  // PR-8: 256 KB
+    Harness harness(/*send_capacity=*/512);
+    // The body is 256 KiB (PR-8).
+    constexpr std::size_t BODY = std::size_t{256} * 1024;
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/gen", [](const HTTPRequestView&, HTTPResponse& res) {
             res.set_body_generator(pattern_generator, nullptr, BODY,
@@ -545,10 +537,7 @@ TEST(HttpServiceTest, GeneratorBodyStreamsLargeBodyBitExactUnderBackpressure) {
     EXPECT_GT(harness.service->statistics().backpressure_events, 0U);
 }
 
-// Counts how many body bytes the generator is asked to produce across all
-// resumes. With send_credit clamping, every produced byte is one the transmit
-// ring accepted, so the total equals the body size exactly — no stalled chunk
-// is ever generated and then discarded and regenerated.
+// The produced-byte count detects regeneration of discarded chunks.
 struct CountingGenerator {
     std::size_t bytes_produced = 0;
     std::size_t calls = 0;
@@ -569,7 +558,7 @@ std::size_t counting_generator(void* ctx, std::size_t offset,
 
 TEST(HttpServiceTest, GeneratorIsNotReinvokedForBytesTheRingRejects) {
     Harness harness(
-        /*send_capacity=*/512);  // tiny ring: many stalls and resumes
+        /*send_capacity=*/512);  // The small ring forces repeated stalls.
     constexpr std::size_t BODY = std::size_t{16} * 1024;
     CountingGenerator gen;
     EXPECT_TRUE(harness.service->add_route(
@@ -584,19 +573,13 @@ TEST(HttpServiceTest, GeneratorIsNotReinvokedForBytesTheRingRejects) {
 
     const std::size_t body_start = response.find("\r\n\r\n") + 4;
     ASSERT_EQ(response.size() - body_start, BODY);
-    // The clamp to send_credit means the generator produced exactly the body
-    // once (retires the README "generator regeneration under backpressure"
-    // limitation); pre-fix this would exceed BODY as stalled chunks regenerate.
     EXPECT_EQ(gen.bytes_produced, BODY);
     EXPECT_GT(harness.service->statistics().backpressure_events, 0U);
 }
 
-// --- Chunked / length-less generator responses (NR-6) ------------------------
+// Unknown-length response bodies (NR-6).
 
-// A length-less generator: produces a bounded pattern body and returns 0 once
-// `offset` reaches `total`, the end-of-body signal for the two-argument
-// set_body_generator. `produced` accumulates every byte the writer asked for,
-// so a test can assert the generator ran exactly once over the body.
+// The produced-byte count detects duplicate generation across stalls.
 struct BoundedGenerator {
     std::size_t total = 0;
     std::size_t produced = 0;
@@ -607,7 +590,7 @@ std::size_t bounded_generator(void* ctx, std::size_t offset,
                               std::span<std::uint8_t> out) {
     auto* state = static_cast<BoundedGenerator*>(ctx);
     if (offset >= state->total) {
-        return 0;  // end-of-body
+        return 0;
     }
     const std::size_t n = std::min(out.size(), state->total - offset);
     for (std::size_t i = 0; i < n; ++i) {
@@ -618,8 +601,6 @@ std::size_t bounded_generator(void* ctx, std::size_t offset,
 }
 }  // namespace
 
-// Decode Transfer-Encoding: chunked framing back to the payload, so a test can
-// compare against what the generator produced.
 namespace {
 std::string decode_chunked(std::string_view framed) {
     std::string out;
@@ -633,10 +614,10 @@ std::string decode_chunked(std::string_view framed) {
             std::stoul(std::string(framed.substr(pos, eol - pos)), nullptr, 16);
         pos = eol + 2;
         if (size == 0) {
-            break;  // last-chunk
+            break;
         }
         out.append(framed.substr(pos, size));
-        pos += size + 2;  // chunk-data + trailing CRLF
+        pos += size + 2;
     }
     return out;
 }
@@ -677,7 +658,8 @@ TEST(HttpServiceTest, ChunkedGeneratorResponseRoundTrips) {
 
 TEST(HttpServiceTest, ChunkedResponseStreamsBitExactUnderBackpressure) {
     Harness harness(
-        /*send_capacity=*/64);  // tiny ring: framing spans many resumes
+        // The small ring splits framing across resumptions.
+        /*send_capacity=*/64);
     BoundedGenerator gen{.total = 8192U};
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/stream", [&](const HTTPRequestView&, HTTPResponse& res) {
@@ -693,8 +675,6 @@ TEST(HttpServiceTest, ChunkedResponseStreamsBitExactUnderBackpressure) {
         decode_chunked(std::string_view(resp).substr(body_start));
     ASSERT_EQ(decoded.size(), gen.total);
     expect_pattern(decoded);
-    // send_credit bounds each frame, so the generator produced the body exactly
-    // once despite stalling on nearly every chunk.
     EXPECT_EQ(gen.produced, gen.total);
     EXPECT_GT(harness.service->statistics().backpressure_events, 0U);
 }
@@ -711,8 +691,6 @@ TEST(HttpServiceTest, ChunkedDowngradesToCloseDelimitedForHttp10) {
     const std::string resp =
         round_trip(harness, id, "GET /stream HTTP/1.0\r\n\r\n");
 
-    // No chunked framing an HTTP/1.0 client cannot parse: raw body, closed to
-    // delimit it.
     EXPECT_EQ(resp.find("Transfer-Encoding"), std::string::npos);
     EXPECT_EQ(resp.find("Content-Length"), std::string::npos);
     EXPECT_NE(resp.find("Connection: close\r\n"), std::string::npos);
@@ -720,15 +698,13 @@ TEST(HttpServiceTest, ChunkedDowngradesToCloseDelimitedForHttp10) {
     ASSERT_EQ(resp.size() - body_start, gen.total);
     expect_pattern(std::string_view(resp).substr(body_start));
     EXPECT_FALSE(
-        harness.wire->is_open(id));  // connection closed after the body
+        // EOF is the only body delimiter for this response.
+        harness.wire->is_open(id));
 }
 
 TEST(HttpServiceTest, Http10DowngradeOverridesAHandlerSetKeepAliveHeader) {
-    // The close-delimited downgrade is decided after should_keep_alive() has
-    // already let the handler's Connection header win, so the head must not
-    // echo it: a close-delimited body carries no Content-Length and no
-    // Transfer-Encoding, and announcing keep-alive on top of that leaves the
-    // client with no way to know where the body ends (NR-2, NR-6).
+    // A close-delimited body must not announce keep-alive, which would hide
+    // its end from the client (NR-2, NR-6).
     Harness harness;
     BoundedGenerator gen{.total = 300U};
     EXPECT_TRUE(harness.service->add_route(
@@ -753,8 +729,7 @@ TEST(HttpServiceTest, Http10DowngradeOverridesAHandlerSetKeepAliveHeader) {
 }
 
 TEST(HttpServiceTest, RequestCapClosesDespiteAHandlerSetKeepAliveHeader) {
-    // The cap bounds slot occupancy, so a handler cannot hold the slot open
-    // past it by setting Connection: keep-alive (CXX-12.7).
+    // A handler cannot override the request cap with Connection: keep-alive.
     Harness harness;
     HttpService::KeepAliveConfig config;
     config.max_requests_per_connection = 1;
@@ -793,20 +768,17 @@ TEST(HttpServiceTest, KeepAliveSurvivesChunkedResponse) {
         round_trip(harness, id, "GET /stream HTTP/1.1\r\nHost: h\r\n\r\n");
     EXPECT_NE(r1.find("Transfer-Encoding: chunked\r\n"), std::string::npos);
     ASSERT_TRUE(
-        harness.wire->is_open(id));  // chunked is self-delimiting: stays open
+        // The last-chunk delimits the body without closing TCP.
+        harness.wire->is_open(id));
 
-    // A second request on the same connection is served normally.
     const std::string all =
         round_trip(harness, id, "GET /ping HTTP/1.1\r\nHost: h\r\n\r\n");
     EXPECT_TRUE(all.ends_with("pong"));
 }
 
-// --- OR-1 counters -----------------------------------------------------------
+// Counter accounting (OR-1).
 
-// RR-4: the counter set accounts for every connection. Each accepted
-// connection is either still open or ended with exactly one disconnect reason,
-// the timeout total is the sum of its kinds, and parse_errors the sum of its
-// classes -- the identities a soak checks the device's /stats against.
+// The soak checks these same counter identities on the device (RR-4).
 TEST(HttpServiceTest, TheCountersAccountForEveryConnection) {
     // A small send window, so a large response stalls for the write timeout.
     Harness harness(/*send_capacity=*/512);
@@ -817,7 +789,7 @@ TEST(HttpServiceTest, TheCountersAccountForEveryConnection) {
         }));
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/defer", [](const HTTPRequestView&, HTTPResponse&) {
-            return Disposition::PENDING;  // never resolved: the handler timeout
+            return Disposition::PENDING;
         }));
     const auto closed = [&] {
         const auto& stats = harness.service->statistics();
@@ -825,29 +797,33 @@ TEST(HttpServiceTest, TheCountersAccountForEveryConnection) {
                stats.disconnect_aborted + stats.disconnect_timeout +
                stats.disconnect_server_closed;
     };
-    // Every close path, one connection each.
+    // Each close path and timeout kind has its own connection.
     harness.wire->close_peer(harness.wire->connect());
     harness.wire->reset_peer(harness.wire->connect());
     harness.wire->abort_local(harness.wire->connect());
+    // The server closes this connection.
+    round_trip(harness, harness.wire->connect(), "BAD\r\n\r\n");
+    // This connection idles.
     round_trip(harness, harness.wire->connect(),
-               "BAD\r\n\r\n");  // server close
-    round_trip(harness, harness.wire->connect(),
-               "GET / HTTP/1.1\r\nHost: h\r\n\r\n");           // then idles
-    harness.wire->deliver_text(harness.wire->connect(), "G");  // header
+               "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
+    // This connection reaches the header deadline.
+    harness.wire->deliver_text(harness.wire->connect(), "G");
+    // This connection reaches the body deadline.
     harness.wire->deliver_text(
         harness.wire->connect(),
-        "POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nab");  // body
+        "POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nab");
+    // This connection's unacknowledged response holds a write deadline.
+    harness.wire->deliver_text(harness.wire->connect(),
+                               "GET /big HTTP/1.1\r\nHost: h\r\n\r\n");
+    // This connection reaches the drain linger deadline.
     harness.wire->deliver_text(
         harness.wire->connect(),
-        "GET /big HTTP/1.1\r\nHost: h\r\n\r\n");  // write
-    harness.wire->deliver_text(
-        harness.wire->connect(),
-        "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");  // drain
-    harness.wire->deliver_text(
-        harness.wire->connect(),
-        "GET /defer HTTP/1.1\r\nHost: h\r\n\r\n");  // handler
-    harness.wire->advance_time(
-        16000);  // past every timeout, idle's 15 s included
+        "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
+    // The pending handler retains its own deadline.
+    harness.wire->deliver_text(harness.wire->connect(),
+                               "GET /defer HTTP/1.1\r\nHost: h\r\n\r\n");
+    // Sixteen seconds exceeds every deadline, including idle.
+    harness.wire->advance_time(16000);
 
     const auto& stats = harness.service->statistics();
     EXPECT_EQ(stats.accepts, 10U);
@@ -883,7 +859,7 @@ TEST(HttpServiceTest, RefusalsCounterIncrementsWhenSlotsFull) {
         EXPECT_TRUE(id.valid());
         ids.push_back(id);
     }
-    // The next connect finds no free slot: refused at the TCP layer (RR-3).
+    // Slot exhaustion rejects the connection at TCP level (RR-3).
     EXPECT_FALSE(harness.wire->connect().valid());
     EXPECT_EQ(harness.service->statistics().refusals_slot_full, 1U);
 }
@@ -894,22 +870,21 @@ TEST(HttpServiceTest, ParseErrorClassCountersAreTracked) {
         const ConnectionId id = harness.wire->connect();
         round_trip(harness, id, req);
     };
-    send(
-        "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 100000\r\n\r\n");  // 413
-    send("GET /" + std::string(600, 'a') +
-         " HTTP/1.1\r\nHost: h\r\n\r\n");  // 414
+    // One request each for the 413, 414, 431, 501, 400 and 505 classes;
+    // UnknownExpectationReturns417 covers 417.
+    send("POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 100000\r\n\r\n");
+    send("GET /" + std::string(600, 'a') + " HTTP/1.1\r\nHost: h\r\n\r\n");
     {
         std::string req = "GET / HTTP/1.1\r\nHost: h\r\n";
         for (int i = 0; i < 20; ++i) {
             req += "H" + std::to_string(i) + ": v\r\n";
         }
         req += "\r\n";
-        send(req);  // 431
+        send(req);
     }
-    send(
-        "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n");  // 501
-    send("GET /x\r\n\r\n");           // 400: malformed request line
-    send("GET /x HTTP/2.0\r\n\r\n");  // 505: unsupported version
+    send("POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n");
+    send("GET /x\r\n\r\n");
+    send("GET /x HTTP/2.0\r\n\r\n");
 
     const auto& text = harness.service->statistics();
     EXPECT_EQ(text.parse_errors_413, 1U);
@@ -921,16 +896,15 @@ TEST(HttpServiceTest, ParseErrorClassCountersAreTracked) {
     EXPECT_EQ(text.parse_errors, 6U);
 }
 
-// --- Timeouts (TR-1..TR-5) enforced via the transport's timeout scan --------
+// Transport timeout scans (TR-1..TR-5).
 
 TEST(HttpServiceTest, HeaderTimeoutClosesSlowlorisAndCountsIt) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
-    // Drip a partial request head, byte by byte, past the 5 s header window.
-    // The window is fixed from accept, so drip must not keep resetting it.
+    // Drip-fed bytes must not reset the header window from accept.
     for (int i = 0; i < 4; ++i) {
         harness.wire->deliver_text(id, "G");
-        harness.wire->advance_time(2000);  // 4 × 2 s = 8 s > 5 s header timeout
+        harness.wire->advance_time(2000);
     }
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_header, 1U);
@@ -939,21 +913,18 @@ TEST(HttpServiceTest, HeaderTimeoutClosesSlowlorisAndCountsIt) {
 TEST(HttpServiceTest, BodyProgressTimeoutClosesStalledUpload) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
-    // Head complete, body declared but stalled: the body-progress deadline
-    // (TR-2, 5 s) governs — not the header window and not idle.
+    // The completed head switches timing to body progress (TR-2).
     harness.wire->deliver_text(
         id, "POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nab");
     ASSERT_TRUE(harness.wire->is_open(id));
     harness.wire->advance_time(4000);
-    EXPECT_TRUE(harness.wire->is_open(id));  // under the 5 s body window
-    harness.wire->advance_time(2000);        // 6 s with no body progress
+    EXPECT_TRUE(harness.wire->is_open(id));
+    harness.wire->advance_time(2000);
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_body, 1U);
 }
 
-// TR-2's tolerance, at both edges: open 200 ms before the 5,000 ms deadline and
-// closed 200 ms after it. The fake clock is exact, so the band is what the
-// deadline arithmetic gives, not what a scheduler happens to deliver.
+// The fake clock checks both edges of the 200 ms tolerance (TR-2).
 TEST(HttpServiceTest, BodyProgressTimeoutFiresWithinItsBand) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
@@ -961,7 +932,7 @@ TEST(HttpServiceTest, BodyProgressTimeoutFiresWithinItsBand) {
         id, "POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\nab");
     harness.wire->advance_time(4800);
     EXPECT_TRUE(harness.wire->is_open(id));
-    harness.wire->advance_time(400);  // 5,200 ms
+    harness.wire->advance_time(400);
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_body, 1U);
 }
@@ -982,13 +953,13 @@ TEST(HttpServiceTest, IdleKeepAliveConnectionTimesOut) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
     round_trip(
-        harness, id,
-        "GET / HTTP/1.1\r\nHost: h\r\n\r\n");  // completes, stays open (idle)
+        // Only a completed response arms the idle deadline.
+        harness, id, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
     ASSERT_TRUE(harness.wire->is_open(id));
 
-    harness.wire->advance_time(14000);  // under the 15 s idle timeout
+    harness.wire->advance_time(14000);
     EXPECT_TRUE(harness.wire->is_open(id));
-    harness.wire->advance_time(2000);  // now past it
+    harness.wire->advance_time(2000);
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_idle, 1U);
 }
@@ -997,8 +968,8 @@ TEST(HttpServiceTest, CompletedRequestClearsHeaderTimeout) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
     round_trip(harness, id, "GET / HTTP/1.1\r\nHost: h\r\n\r\n");
-    // A completed request must have moved off the 5 s header deadline onto the
-    // 15 s idle one, so advancing just past 5 s does not close it.
+    // A completed request must switch from the 5 s header deadline to
+    // the 15 s idle deadline.
     harness.wire->advance_time(6000);
     EXPECT_TRUE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_header, 0U);
@@ -1006,7 +977,7 @@ TEST(HttpServiceTest, CompletedRequestClearsHeaderTimeout) {
 
 TEST(HttpServiceTest, WriteStallTimeoutClosesSlowReader) {
     Harness harness(
-        /*send_capacity=*/512);  // tiny buffer: response can't fully send
+        /*send_capacity=*/512);
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/big", [](const HTTPRequestView&, HTTPResponse& res) {
             res.set_body_static(StaticBody::outliving_response(x_body(100000)));
@@ -1014,16 +985,15 @@ TEST(HttpServiceTest, WriteStallTimeoutClosesSlowReader) {
         }));
     const ConnectionId id = harness.wire->connect();
     harness.wire->deliver_text(id, "GET /big HTTP/1.1\r\nHost: h\r\n\r\n");
-    // Response is now stalled on backpressure (peer never acks). The write
-    // deadline (10 s) should fire without any ACK progress.
+    // The 10 s write deadline should fire without ACK progress.
     ASSERT_TRUE(harness.wire->is_open(id));
     harness.wire->advance_time(11000);
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_write, 1U);
 }
 
-// TR-4's tolerance, at both edges: open 200 ms before the 10,000 ms write
-// deadline and closed 200 ms after it, with no ACK progress throughout.
+// The write deadline holds 200 ms before 10 s and fires 200 ms after it,
+// with no ACK in between (TR-4).
 TEST(HttpServiceTest, WriteStallTimeoutFiresWithinItsBand) {
     Harness harness(/*send_capacity=*/512);
     EXPECT_TRUE(harness.service->add_route(
@@ -1035,39 +1005,36 @@ TEST(HttpServiceTest, WriteStallTimeoutFiresWithinItsBand) {
     harness.wire->deliver_text(id, "GET /big HTTP/1.1\r\nHost: h\r\n\r\n");
     harness.wire->advance_time(9800);
     EXPECT_TRUE(harness.wire->is_open(id));
-    harness.wire->advance_time(400);  // 10,200 ms
+    harness.wire->advance_time(400);
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_write, 1U);
 }
 
-// A partial next request that surfaces only after a backpressured response
-// finished draining must be governed by the 5 s header window (TR-1), not the
-// stale 10 s write-stall deadline left armed from the previous response.
+// A partial pipelined head must use the 5 s header window after the preceding
+// response drains (TR-1).
 TEST(HttpServiceTest,
      PartialPipelinedRequestAfterBackpressureUsesHeaderTimeout) {
-    Harness harness(/*send_capacity=*/512);  // force response A to backpressure
+    Harness harness(/*send_capacity=*/512);
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/big", [](const HTTPRequestView&, HTTPResponse& res) {
             res.set_body_static(StaticBody::outliving_response(x_body(4000)));
             return Disposition::COMPLETE;
         }));
     const ConnectionId id = harness.wire->connect();
-    // Request A (head complete) immediately followed by the first bytes of
-    // request B's head. A's large response stalls under backpressure.
     harness.wire->deliver_text(id,
                                "GET /big HTTP/1.1\r\nHost: h\r\n\r\nGET /bi");
-    harness.flush(id);  // drain A; B's partial head is now pending
+    harness.flush(id);
     ASSERT_TRUE(harness.wire->is_open(id));
 
     harness.wire->advance_time(
-        6000);  // past the 5 s header window, under 10 s write
+        // Six seconds separates the header and write deadlines.
+        6000);
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_header, 1U);
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_write, 0U);
 }
 
-// NR-5: a request carrying "Expect: 100-continue" gets an interim 100 response
-// before its body, and the final response follows it in order.
+// The interim response precedes the body and final response (NR-5).
 TEST(HttpServiceTest, Expect100ContinueEmittedBeforeBody) {
     Harness harness;
     std::string got;
@@ -1078,8 +1045,6 @@ TEST(HttpServiceTest, Expect100ContinueEmittedBeforeBody) {
             return Disposition::COMPLETE;
         }));
     const ConnectionId id = harness.wire->connect();
-    // Client sends only the head and waits for 100 before transmitting the
-    // body.
     harness.wire->deliver_text(
         id,
         "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n"
@@ -1089,7 +1054,6 @@ TEST(HttpServiceTest, Expect100ContinueEmittedBeforeBody) {
     EXPECT_NE(interim.find("HTTP/1.1 100 Continue\r\n\r\n"), std::string::npos);
     ASSERT_TRUE(harness.wire->is_open(id));
 
-    // Body arrives; the handler runs and the 200 follows the 100 in order.
     harness.wire->deliver_text(id, "hello");
     harness.flush(id);
     EXPECT_EQ(got, "hello");
@@ -1099,7 +1063,7 @@ TEST(HttpServiceTest, Expect100ContinueEmittedBeforeBody) {
     EXPECT_LT(full.find("100 Continue"), full.find("200 OK"));
 }
 
-// NR-5: RFC 9110 10.1.1 requires HTTP/1.0 to ignore this expectation.
+// HTTP/1.0 ignores the expectation (NR-5, RFC 9110 §10.1.1).
 TEST(HttpServiceTest, Http10IgnoresContinueExpectation) {
     Harness harness;
     std::string got;
@@ -1110,7 +1074,7 @@ TEST(HttpServiceTest, Http10IgnoresContinueExpectation) {
             return Disposition::COMPLETE;
         }));
     const ConnectionId id = harness.wire->connect();
-    // Sending the head alone must not produce an interim response.
+    // The head alone must not produce an interim response.
     harness.wire->deliver_text(
         id,
         "POST /echo HTTP/1.0\r\nHost: h\r\nContent-Length: 5\r\n"
@@ -1120,7 +1084,6 @@ TEST(HttpServiceTest, Http10IgnoresContinueExpectation) {
     EXPECT_TRUE(interim.empty());
     ASSERT_TRUE(harness.wire->is_open(id));
 
-    // The body is read normally and the handler produces the final 200.
     harness.wire->deliver_text(id, "hello");
     harness.flush(id);
     EXPECT_EQ(got, "hello");
@@ -1129,12 +1092,8 @@ TEST(HttpServiceTest, Http10IgnoresContinueExpectation) {
     ASSERT_NE(full.find("200 OK"), std::string::npos);
 }
 
-// NR-5 regression: the interim 100 must survive a partially-accepted write. A
-// pipelined "Expect: 100-continue" head can complete while the previous
-// response still occupies the transmit ring, so the small write is not
-// all-or-nothing; the service must resume the interim response from its byte
-// cursor, never restart it (a restart puts "HTTP/1.1 1HTTP/1.1 100 Continue"
-// on the wire).
+// The interim 100 must survive a partial write and must resume at its cursor.
+// Restarting would duplicate its prefix (NR-5).
 TEST(HttpServiceTest, PartiallyAcceptedContinueResumesWithoutCorruption) {
     constexpr std::string_view CONTINUE = "HTTP/1.1 100 Continue\r\n\r\n";
     auto add_routes = [](Harness& harness, std::string& got) {
@@ -1152,7 +1111,6 @@ TEST(HttpServiceTest, PartiallyAcceptedContinueResumesWithoutCorruption) {
             }));
     };
 
-    // Measure the exact /pad response size on a wide-open ring.
     std::size_t pad_size = 0;
     {
         Harness probe;
@@ -1163,8 +1121,8 @@ TEST(HttpServiceTest, PartiallyAcceptedContinueResumesWithoutCorruption) {
                        .size();
     }
 
-    // Ring sized so that with the whole /pad response unacked in flight, only
-    // 10 bytes of credit remain: the interim 100 is accepted only partially.
+    // Ten bytes of credit split the interim 100 after the unacknowledged /pad
+    // response.
     Harness harness(pad_size + 10);
     std::string got;
     add_routes(harness, got);
@@ -1174,36 +1132,29 @@ TEST(HttpServiceTest, PartiallyAcceptedContinueResumesWithoutCorruption) {
         id,
         "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n"
         "Expect: 100-continue\r\n\r\n");
-    // Nothing acked yet: exactly 10 bytes of the interim 100 went out.
     EXPECT_EQ(harness.wire->send_inflight(id), pad_size + 10);
 
-    harness.flush(id);  // peer reads; the remainder resumes mid-message
+    harness.flush(id);
     harness.wire->deliver_text(id, "hello");
     harness.flush(id);
 
     const std::string full = harness.wire->sent_text(id);
     EXPECT_EQ(got, "hello");
-    // Exactly one interim response, contiguous, directly after /pad's bytes.
     EXPECT_EQ(full.substr(pad_size, CONTINUE.size()), CONTINUE);
     const std::size_t first = full.find("HTTP/1.1 100");
     ASSERT_NE(first, std::string::npos);
     EXPECT_EQ(full.find("HTTP/1.1 100", first + 1), std::string::npos);
-    // ...and the final response follows it in order.
     const std::size_t final_pos = full.find("HTTP/1.1 200 OK", pad_size);
     ASSERT_NE(final_pos, std::string::npos);
     EXPECT_EQ(final_pos, pad_size + CONTINUE.size());
 }
 
-// A handler whose header block overflows the fixed head buffer must still get a
-// real status line (a 500) + Connection: close, never an opaque silent close
+// An overflowing response head must produce 500 with Connection: close
 // (BR-13).
 TEST(HttpServiceTest, OversizedResponseHeadYields500NotSilentClose) {
     Harness harness;
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/big", [](const HTTPRequestView&, HTTPResponse& res) {
-            // Many headers whose total far exceeds
-            // HEAD_CAPACITY (1024 B); each value stays under
-            // the per-value cap.
             for (int i = 0; i < 12; ++i) {
                 res.headers.set("X-Pad-" + std::to_string(i),
                                 std::string(120, 'v'));
@@ -1219,8 +1170,7 @@ TEST(HttpServiceTest, OversizedResponseHeadYields500NotSilentClose) {
     EXPECT_FALSE(harness.wire->is_open(id));
 }
 
-// BR-13 in full: the fixed 500 head is the whole response. Nothing of the
-// handler's own head or body follows it.
+// The fixed 500 replaces the handler's entire response (BR-13).
 TEST(HttpServiceTest, OversizedResponseHeadSendsOnlyTheFixed500) {
     Harness harness;
     EXPECT_TRUE(harness.service->add_route(
@@ -1241,9 +1191,8 @@ TEST(HttpServiceTest, OversizedResponseHeadSendsOnlyTheFixed500) {
     EXPECT_EQ(harness.service->statistics().responses_refused, 1U);
 }
 
-// BR-14: a copied body is held in the slot until the response is sent, so one
-// over MAX_BUFFERED_BODY is refused with the fixed 500 rather than adopted.
-// That is what makes AR-1's MAX_CONNECTIONS x MAX_BUFFERED_BODY bound hold.
+// Oversized copied bodies produce the fixed 500 without adoption (BR-14,
+// AR-1).
 TEST(HttpServiceTest, CopiedBodyOverTheCapIsAnswered500) {
     Harness harness;
     constexpr std::size_t CAP = HttpService::Limits::MAX_BUFFERED_BODY;
@@ -1262,14 +1211,13 @@ TEST(HttpServiceTest, CopiedBodyOverTheCapIsAnswered500) {
     EXPECT_EQ(harness.service->statistics().responses_refused, 1U);
 }
 
-// BR-14: a copied body the handler wrote directly, bypassing set_body, is
-// refused and not held once the fixed 500 is answered.
+// Direct body writes also enforce the copied-body cap (BR-14).
 TEST(HttpServiceTest, ARefusedCopiedBodyIsFreedNotHeld) {
     if (!pico_util::HeapWatermark::measuring()) {
         GTEST_SKIP() << "this build cannot read the live heap";
     }
     Harness harness;
-    // Below glibc's mmap threshold, so the allocation is one uordblks counts.
+    // Below glibc's mmap threshold, uordblks counts this allocation.
     constexpr std::size_t BIG = std::size_t{64} * 1024;
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/over", [](const HTTPRequestView&, HTTPResponse& res) {
@@ -1284,16 +1232,14 @@ TEST(HttpServiceTest, ARefusedCopiedBodyIsFreedNotHeld) {
     EXPECT_LT(pico_util::HeapWatermark::in_use_bytes(), before + (BIG / 2));
 }
 
-// AR-1: a body within the cap does not carry spare capacity into the slot. The
-// slot holds its body until the response is sent, so a body whose capacity was
-// reserved past the cap would hold more than MAX_BUFFERED_BODY while in flight.
-// An 8 B send window keeps the response from completing while the heap is read.
+// A reserved capacity above the body cap detects untrimmed adoption. The 8 B
+// window keeps the response in flight during measurement (AR-1).
 TEST(HttpServiceTest, SpareBodyCapacityIsNotCarriedIntoTheSlot) {
     if (!pico_util::HeapWatermark::measuring()) {
         GTEST_SKIP() << "this build cannot read the live heap";
     }
     Harness harness(/*send_capacity=*/8);
-    // Below glibc's mmap threshold, so the allocation is one uordblks counts.
+    // Below glibc's mmap threshold, uordblks counts this allocation.
     constexpr std::size_t BIG = std::size_t{64} * 1024;
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/direct", [](const HTTPRequestView&, HTTPResponse& res) {
@@ -1305,15 +1251,13 @@ TEST(HttpServiceTest, SpareBodyCapacityIsNotCarriedIntoTheSlot) {
     const std::size_t before = pico_util::HeapWatermark::in_use_bytes();
     harness.wire->deliver_text(id, "GET /direct HTTP/1.1\r\nHost: h\r\n\r\n");
     ASSERT_GT(harness.wire->send_inflight(id),
-              0U);  // the response is in flight
-    // What the slot may hold in flight is one body within the cap.
+              0U);  // One copied body within the cap may remain in flight.
     EXPECT_LE(pico_util::HeapWatermark::in_use_bytes(),
               before + HttpService::Limits::MAX_BUFFERED_BODY);
 }
 
-// AR-1: a connection torn down mid-send frees the copied body it held, so the
-// slot is idle with nothing allocated. The same steps with a static body are
-// the control, as in ASentCopiedBodyIsNotHeldByTheSlot below.
+// The static-body control isolates copied heap from fake-transport storage
+// (AR-1).
 TEST(HttpServiceTest, ACopiedBodyStalledMidSendIsFreedWhenThePeerResets) {
     if (!pico_util::HeapWatermark::measuring()) {
         GTEST_SKIP() << "this build cannot read the live heap";
@@ -1343,11 +1287,8 @@ TEST(HttpServiceTest, ACopiedBodyStalledMidSendIsFreedWhenThePeerResets) {
     EXPECT_LT(growth(true), control + (CAP / 2));
 }
 
-// AR-1: once a copied body is on the wire the slot frees it, so an idle
-// keep-alive connection holds no copied-body heap and the peak stays within
-// MAX_CONNECTIONS x MAX_BUFFERED_BODY. The fake transport keeps every byte it
-// sends, so the same bytes served as a static body are the control: the
-// difference between the two is what the slot holds.
+// The fake retains sent bytes. A static-body control isolates heap held by
+// the idle slot (AR-1).
 TEST(HttpServiceTest, ASentCopiedBodyIsNotHeldByTheSlot) {
     if (!pico_util::HeapWatermark::measuring()) {
         GTEST_SKIP() << "this build cannot read the live heap";
@@ -1373,16 +1314,14 @@ TEST(HttpServiceTest, ASentCopiedBodyIsNotHeldByTheSlot) {
                 harness, id, "GET /body HTTP/1.1\r\nHost: h\r\n\r\n");
             EXPECT_TRUE(response.ends_with(x_body(CAP)));
         }
-        EXPECT_TRUE(harness.wire->is_open(id));  // idle on keep-alive
+        EXPECT_TRUE(harness.wire->is_open(id));
         return pico_util::HeapWatermark::in_use_bytes() - before;
     };
     const std::size_t control = growth(false);
     EXPECT_LT(growth(true), control + (CAP / 2));
 }
 
-// BR-14's limit is inclusive: a copied body of exactly MAX_BUFFERED_BODY is
-// served whole, and through backpressure, since a 512 B send window needs
-// several resumes to carry it (AR-5).
+// The at-cap body crosses several ring fills (BR-14, AR-5).
 TEST(HttpServiceTest, CopiedBodyAtTheCapIsServed) {
     Harness harness(/*send_capacity=*/512);
     constexpr std::size_t CAP = HttpService::Limits::MAX_BUFFERED_BODY;
@@ -1400,27 +1339,22 @@ TEST(HttpServiceTest, CopiedBodyAtTheCapIsServed) {
 }
 
 TEST(HttpServiceTest, DrainCloseLingerTimeoutFires) {
-    Harness
-        harness;  // ample send buffer: the whole response is handed to the wire
+    Harness harness;
     const ConnectionId id = harness.wire->connect();
-    // Connection: close: the service hands off the full response then calls
-    // close_client, which arms the 2 s drain linger. We never ack, so the
-    // transport is stuck waiting for the peer to drain — TR-5 must fire.
+    // Without ACKs, TR-5 must reclaim the connection waiting for its close to
+    // drain.
     harness.wire->deliver_text(
         id, "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
-    ASSERT_TRUE(harness.wire->is_open(id));  // draining, awaiting ack
+    ASSERT_TRUE(harness.wire->is_open(id));
     harness.wire->advance_time(1500);
-    EXPECT_TRUE(harness.wire->is_open(id));  // under the 2 s linger
-    harness.wire->advance_time(1000);        // total 2.5 s: past it
+    EXPECT_TRUE(harness.wire->is_open(id));
+    harness.wire->advance_time(1000);
     EXPECT_FALSE(harness.wire->is_open(id));
-    // Drain-linger expiry is its own reason, distinct from a graceful close, so
-    // an undrained peer is not miscounted as server_closed.
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_drain, 1U);
     EXPECT_EQ(harness.service->statistics().disconnect_server_closed, 0U);
 }
 
-// TR-5's tolerance, at both edges: open 200 ms before the 2,000 ms linger ends
-// and closed 200 ms after it.
+// Both edges of the 200 ms linger tolerance are checked (TR-5).
 TEST(HttpServiceTest, DrainCloseLingerFiresWithinItsBand) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();
@@ -1428,21 +1362,14 @@ TEST(HttpServiceTest, DrainCloseLingerFiresWithinItsBand) {
         id, "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n");
     harness.wire->advance_time(1800);
     EXPECT_TRUE(harness.wire->is_open(id));
-    harness.wire->advance_time(400);  // 2,200 ms
+    harness.wire->advance_time(400);
     EXPECT_FALSE(harness.wire->is_open(id));
     EXPECT_EQ(harness.service->statistics().disconnect_timeout_drain, 1U);
 }
 
-// One arrival split across segments, the way lwIP delivers a chained pbuf: the
-// only shape that raises a teardown *between* segments of a single arrival,
-// which deliver() cannot reach because it opens a scope per call. A request
-// pipelined behind a "Connection: close" must not be served (RFC 9112 §9.6).
-//
-// Two independent guards hold this: the connection's `closing` flag, and
-// conn_for() refusing to resolve an id the transport has already released. The
-// first is what this exercises today — every service-initiated teardown sets
-// `closing` before releasing the slot — so the test pins the behaviour rather
-// than discriminating between the two mechanisms.
+// One segmented arrival keeps a CallbackScope across teardown. The pipelined
+// request after Connection: close must not be served (RFC 9112 §9.6). The
+// closing flag guards it before conn_for() can observe a released slot.
 TEST(HttpServiceTest, PipelinedRequestBehindCloseIsNotDispatched) {
     Harness harness;
     int dispatched = 0;
@@ -1454,8 +1381,6 @@ TEST(HttpServiceTest, PipelinedRequestBehindCloseIsNotDispatched) {
         }));
 
     const ConnectionId id = harness.connect();
-    // "Connection: close" on the first request tears the slot down as soon as
-    // its response drains; the second segment arrives inside the same scope.
     std::array<std::string_view, 2> segments{
         "GET /x HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
         "GET /x HTTP/1.1\r\nHost: h\r\n\r\n",
@@ -1467,9 +1392,6 @@ TEST(HttpServiceTest, PipelinedRequestBehindCloseIsNotDispatched) {
     EXPECT_FALSE(harness.wire->is_open(id));
 }
 
-// A translation unit compiled with different profile macros than the library
-// disagrees with it about the layout of every type crossing the constructor.
-// The check exists because that failure is otherwise silent.
 TEST(HttpServiceTest, MismatchedProfileBindingAborts) {
     pico_http::ProfileBinding wrong = HttpService::caller_binding();
     wrong.rx_capacity += 1;
@@ -1481,11 +1403,8 @@ TEST(HttpServiceTest, MismatchedProfileBindingAborts) {
         "");
 }
 
-// The named knobs are not the only ones that move the slot layout:
-// HEAD_CAPACITY, GENERATOR_CHUNK and the parser's limits do too, and a
-// downstream profile may add more. conn_size/conn_align stand in for all of
-// them, so a disagreement that none of the named fields would show still
-// aborts.
+// conn_size and conn_align detect layout differences beyond the named profile
+// fields, including fields a downstream profile might add.
 TEST(HttpServiceTest, ProfileBindingDetectsSlotLayoutDrift) {
     pico_http::ProfileBinding wrong = HttpService::caller_binding();
     wrong.conn_size += 1;
@@ -1512,7 +1431,7 @@ TEST(HttpServiceTest, MatchingProfileBindingConstructs) {
     EXPECT_EQ(service.active_connections(), 0U);
 }
 
-// --- Framing is the service's alone (NR-3, NR-6) -----------------------------
+// Service-owned framing (NR-3, NR-6).
 
 namespace {
 
@@ -1529,9 +1448,8 @@ std::size_t count_occurrences(std::string_view haystack,
 }  // namespace
 
 TEST(HttpServiceTest, HandlerSetContentLengthDoesNotReachTheWire) {
-    // A handler-set length is never compared against the body, so echoing one
-    // would frame a 5-byte body as 1024 bytes and leave the client reading the
-    // next pipelined response as the remainder.
+    // Echoing the unchecked handler length would consume bytes from the next
+    // response.
     Harness harness;
     static constexpr std::string_view BODY = "hello";
     EXPECT_TRUE(harness.service->add_route(
@@ -1553,8 +1471,8 @@ TEST(HttpServiceTest, HandlerSetContentLengthDoesNotReachTheWire) {
 }
 
 TEST(HttpServiceTest, HandlerSetContentLengthOnAGeneratorBodyIsDropped) {
-    // The dangerous variant: a length-less generator frames as chunked, so
-    // echoing the handler's Content-Length would emit both framings at once.
+    // Echoing the handler length would announce both chunked and length
+    // framing.
     Harness harness;
     BoundedGenerator gen{.total = 300U};
     EXPECT_TRUE(harness.service->add_route(
@@ -1572,8 +1490,8 @@ TEST(HttpServiceTest, HandlerSetContentLengthOnAGeneratorBodyIsDropped) {
 }
 
 TEST(HttpServiceTest, HandlerSetTransferEncodingDoesNotReachTheWire) {
-    // Chunked framing announced over a buffered body would have the client
-    // read "hello" as a chunk-size line.
+    // Announcing chunked framing would make the client parse hello as a chunk
+    // size.
     Harness harness;
     EXPECT_TRUE(harness.service->add_route(
         "GET", "/te", [](const HTTPRequestView&, HTTPResponse& res) {
@@ -1590,12 +1508,8 @@ TEST(HttpServiceTest, HandlerSetTransferEncodingDoesNotReachTheWire) {
     EXPECT_EQ(count_occurrences(resp, "Content-Length: 5\r\n"), 1U);
 }
 
-// --- Completion-lock lifetime (AR-3) ----------------------------------------
-//
-// stop() closes the server and then clears every slot under the completion
-// lock, so a transport whose lock does not outlive its server is broken. These
-// pin the two orderings a transport must survive; the firmware transport
-// satisfies them by owning the critical section for the object's lifetime.
+// A transport must support completion locking after server close, even when
+// listen failed (AR-3).
 
 TEST(HttpServiceTest, StopTakesTheCompletionLockAfterClosingTheServer) {
     Harness harness;
@@ -1622,12 +1536,7 @@ TEST(HttpServiceTest, StopTakesTheCompletionLockWhenListenNeverSucceeded) {
     EXPECT_TRUE(wire.completion_lock_balanced());
 }
 
-// EN-04.5 for the service's own incremental entry point.
-// HttpService::on_receive assembles bytes in rx_/rx_len_ and compacts the front
-// of that buffer when a request is consumed but bytes remain -- state carried
-// across calls exactly as the parser's is. Segmentation here is chosen by the
-// lwIP pbuf chain, not by the caller, and the finest split anywhere else in
-// this suite was two deliver_text() calls.
+// Byte-at-a-time delivery exercises RX state across on_receive calls.
 TEST(HttpServiceTest, ARequestDeliveredOneByteAtATimeIsAnsweredIdentically) {
     const std::string request =
         "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello";
@@ -1660,9 +1569,7 @@ TEST(HttpServiceTest, ARequestDeliveredOneByteAtATimeIsAnsweredIdentically) {
     EXPECT_EQ(split.wire->sent_text(split_id), expected);
 }
 
-// The same, for two pipelined requests: the second arrives while the first is
-// still in the buffer, so the front-compaction runs with a non-empty remainder
-// -- the path an off-by-one in that std::copy would corrupt.
+// The pipelined pair exercises incremental parsing across request boundaries.
 TEST(HttpServiceTest, PipelinedRequestsDeliveredOneByteAtATimeBothAnswered) {
     int served = 0;
     Harness harness;
@@ -1678,7 +1585,7 @@ TEST(HttpServiceTest, PipelinedRequestsDeliveredOneByteAtATimeBothAnswered) {
     for (const char byte : two) {
         ASSERT_EQ(harness.wire->deliver_text(id, std::string_view(&byte, 1)),
                   1U);
-        harness.flush(id);  // drain as we go, so the window never closes
+        harness.flush(id);  // Draining each byte keeps the receive window open.
     }
 
     const std::string response = harness.wire->sent_text(id);
@@ -1689,17 +1596,9 @@ TEST(HttpServiceTest, PipelinedRequestsDeliveredOneByteAtATimeBothAnswered) {
     EXPECT_TRUE(response.ends_with("2"));
 }
 
-// A pipelined request whose head spans two arrivals, behind a request that
-// already completed in the first of them. Nothing else in the suite delivers a
-// *partial* second request alongside a whole first one.
-//
-// Deliberately not claimed as cover for the rx front-compaction. That copy only
-// moves bytes when the receive loop stops with some still buffered, and the one
-// break that does so is the deferral (`conn.pending`) -- on INCOMPLETE the
-// parser has consumed everything, and on an error the connection closes and the
-// remainder is never read again. DeferredTest.PipelinedRequestWaitsForThe-
-// DeferralThenIsServed is what covers that copy; an off-by-one in it fails
-// there and nowhere else, including here.
+// The second request is partial in the first arrival. RX compaction with
+// retained bytes is covered by
+// DeferredTest.PipelinedRequestWaitsForTheDeferralThenIsServed.
 TEST(HttpServiceTest, APipelinedRequestHeadMaySpanTwoArrivals) {
     std::vector<std::string> uris;
     Harness harness;
@@ -1720,9 +1619,7 @@ TEST(HttpServiceTest, APipelinedRequestHeadMaySpanTwoArrivals) {
     const std::string first = "GET /a HTTP/1.1\r\nHost: h\r\n\r\n";
     const std::string second = "GET /bb HTTP/1.1\r\nHost: h\r\n\r\n";
 
-    // One arrival: all of the first request and the first 12 bytes of the
-    // second. The two URIs differ in length so a boundary slip between them
-    // shows up as a wrong URI rather than a wrong byte count.
+    // Different URI lengths expose a boundary slip as an incorrect URI.
     const std::size_t head = 12;
     ASSERT_EQ(harness.wire->deliver_text(id, first + second.substr(0, head)),
               first.size() + head);
@@ -1739,10 +1636,8 @@ TEST(HttpServiceTest, APipelinedRequestHeadMaySpanTwoArrivals) {
     EXPECT_TRUE(harness.wire->sent_text(id).ends_with("/bb"));
 }
 
-// TR-3's configured value, as distinct from its armed deadline. The transport
-// is told the idle window through set_idle_timeout, and the double records it
-// so a test can assert it -- but nothing read it, so the accessor and the
-// configuration path it reports on were both unexercised.
+// The fake records the configured idle window independently of armed
+// deadlines (TR-3).
 TEST(HttpServiceTest, TheIdleTimeoutTheTransportIsToldFollowsTheConfig) {
     Harness harness;
     EXPECT_EQ(harness.wire->idle_timeout_seconds(),
@@ -1753,7 +1648,6 @@ TEST(HttpServiceTest, TheIdleTimeoutTheTransportIsToldFollowsTheConfig) {
     harness.service->set_keep_alive_config(cfg);
     EXPECT_EQ(harness.wire->idle_timeout_seconds(), 42U);
 
-    // Keep-alive off means no idle window at all, not the default one.
     cfg.enabled = false;
     harness.service->set_keep_alive_config(cfg);
     EXPECT_EQ(harness.wire->idle_timeout_seconds(), 0U);

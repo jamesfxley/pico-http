@@ -15,9 +15,9 @@
 #include "pico_http/http/message.hpp"
 #include "pico_util/testing/allocation_counter.hpp"
 
-// Exactly one translation unit per test executable may include this, and this
-// is that unit: the replaceable allocation functions cannot be inline, so a
-// second include is a duplicate-symbol link error.
+// Exactly one translation unit per executable may include
+// allocation_operators.ipp. Its non-inline replacement operators would
+// otherwise cause duplicate symbols.
 #include "pico_util/testing/allocation_operators.ipp"  // IWYU pragma: keep, it defines the replaced operators
 
 using pico_http::HTTPResponse;
@@ -44,9 +44,8 @@ TEST(HttpResponseTest, SetsBinaryBodyAndContentType) {
     EXPECT_EQ(response.headers.get("content-type"), "application/octet-stream");
 }
 
-// BR-14 at the source: a copied body over the active profile's cap is refused
-// before anything is allocated, so AR-1's bound holds at peak as well as
-// between requests. The flag is what the service answers with its fixed 500.
+// No allocation occurs before an oversized copied body is rejected (BR-14,
+// AR-1).
 TEST(HttpResponseTest, SetBodyOverTheCapAllocatesNothing) {
     constexpr std::size_t CAP =
         PICO_HTTP_ACTIVE_PROFILE::Limits::MAX_BUFFERED_BODY;
@@ -55,7 +54,6 @@ TEST(HttpResponseTest, SetBodyOverTheCapAllocatesNothing) {
     const std::string over(CAP + 1, 'x');
     HTTPResponse::BodyResult result{};
     {
-        // Nothing allocated, not only nothing held afterwards.
         const pico_util::testing::AllocationGuard guard;
         result = res.set_body(over);
         EXPECT_EQ(pico_util::testing::AllocationGuard::count(), 0U);
@@ -72,7 +70,6 @@ TEST(HttpResponseTest, SetBodyOverTheCapAllocatesNothing) {
     EXPECT_EQ(binary.body.capacity(), 0U);
 }
 
-// A body at the cap is copied, and a later body within it clears a refusal.
 TEST(HttpResponseTest, SetBodyAtTheCapIsCopiedAndClearsARefusal) {
     constexpr std::size_t CAP =
         PICO_HTTP_ACTIVE_PROFILE::Limits::MAX_BUFFERED_BODY;
@@ -84,8 +81,8 @@ TEST(HttpResponseTest, SetBodyAtTheCapIsCopiedAndClearsARefusal) {
     EXPECT_EQ(res.body.size(), CAP);
 }
 
-// set_body names what it did: the body set, the body set without its
-// Content-Type (the header value over its cap), or the body refused (BR-14).
+// The result distinguishes body rejection from a missing Content-Type
+// (BR-14).
 TEST(HttpResponseTest, SetBodyReportsWhatItDid) {
     HTTPResponse res;
     EXPECT_EQ(res.set_body("ok"), HTTPResponse::BodyResult::SET);
@@ -102,26 +99,22 @@ TEST(HttpResponseTest, ResetReleasesTheBodyBufferInsteadOfKeepingCapacity) {
 
     response.reset();
 
-    // Emptiness is not enough — the capacity has to be gone. A pooled response
-    // that only cleared would hold its buffer for the life of the pool, heap
-    // no connection owns and outside AR-1's bound.
+    // The capacity has to be freed. Clearing alone retains heap outside the
+    // copied-body bound (AR-1).
     EXPECT_EQ(response.body.capacity(), 0U);
     EXPECT_TRUE(response.body.empty());
 }
 
-// AR-11. The reason set_body_static takes a type rather than a span: a span is
-// what HTTPRequestView::body is, so the trap compiled and transmitted from
-// parser storage the connection had already recycled. These assertions fail if
-// StaticBody ever gains a conversion, which is the only way the trap returns.
+// An implicit span conversion would let recycled request storage back a
+// response (AR-11).
 TEST(HttpResponseTest, ARequestViewCannotBecomeAStaticBody) {
     static_assert(
         !std::convertible_to<std::span<const std::uint8_t>, StaticBody>);
     static_assert(!std::convertible_to<std::string_view, StaticBody>);
     static_assert(
         !std::is_constructible_v<StaticBody, std::span<const std::uint8_t>>);
-    // The named factory is the way in, and naming it is the caller's
-    // assertion. Not constexpr: the char-to-byte reinterpretation is not
-    // allowed in constant evaluation.
+    // This runs at run time: the char-to-byte reinterpretation is not allowed
+    // in constant evaluation.
     EXPECT_EQ(StaticBody::outliving_response(std::string_view("abc")).size(),
               3U);
     EXPECT_EQ(StaticBody::outliving_response(std::string_view("xy")).size(),
@@ -146,7 +139,6 @@ TEST(HttpResponseTest, ResetRestoresEveryFieldToItsDefault) {
     EXPECT_EQ(response.generator, nullptr);
     EXPECT_EQ(response.generator_ctx, nullptr);
     EXPECT_EQ(response.generator_length, 0U);
-    // A stale static_body or generator surviving a reset would serve the
-    // previous request's body to the next one out of the same pool entry.
+    // A stale body source would serve the previous request's body.
     EXPECT_EQ(response.body_size(), 0U);
 }

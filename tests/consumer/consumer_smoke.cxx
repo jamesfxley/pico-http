@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Consumer-side view of the sizing profile. Nothing here defines a profile
-// macro: every value below must arrive through pico_http::config's INTERFACE
-// compile definitions. EXPECT_P8 is set by the harness to the profile the
-// package was built with, so if the definitions stop propagating, the
-// assertions below fail to compile instead of producing translation units whose
-// HttpService layout disagrees with the archive they link against.
+// Profile values must arrive through pico_http::config. EXPECT_P8 selects the
+// independent expectations for this installed package.
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -12,13 +8,8 @@
 #include <span>
 
 #include "pico_http/pico_http.hpp"
-// The porting seam docs/usage-guide.md tells a downstream project to
-// derive from. Included here so the package failing to ship it is a compile
-// error in this test rather than a discovery made by the first porter.
+// The installed package includes the transport extension header.
 #include "pico_http/tcp/transport_base.hpp"
-// The test double the package ships for downstream tests. Included so a
-// pico_http::testing that left the export set, or whose headers did not
-// install, is a compile error here rather than a downstream discovery.
 #include "pico_http/testing/fake_tcp_transport.hpp"
 
 namespace {
@@ -40,16 +31,10 @@ static_assert(Profile::Limits::MAX_BUFFERED_BODY == 2048,
 static_assert(Profile::RX_CAPACITY == pico_http::ADVERTISED_RX_WINDOW,
               "consumer's RX capacity must match the advertised window (AR-6)");
 
-// The custom-transport example from the porting guide, reduced to what it takes
-// to instantiate: a downstream project must be able to satisfy ITcpTransport
-// from the installed package alone. Mirrors tests/tcp/porting_example_test.
-//
-// Synchronous-only, and deliberately so: it overrides none of
-// signal_completion()/lock_completions()/unlock_completions(), so it cannot
-// serve a handler that returns Disposition::PENDING -- respond() would record
-// the completion, return true, and nothing would ever deliver it (AR-9). A
-// real transport either signals its own context or drives notify_poll(), and
-// opens a CallbackScope around whichever it does.
+// A downstream transport must be able to implement ITcpTransport from the
+// installed package alone. This example serves synchronous handlers only.
+// Pending completion needs a context signal or notify_poll() inside a
+// CallbackScope (AR-9).
 struct ConsumerSlot {
     bool close_pending = false;
 };
@@ -60,10 +45,8 @@ class ConsumerTransport
    protected:
     std::uint32_t clock_ms() const override { return 0; }
 
-    // Nothing is ever in flight here because send() accepts everything
-    // synchronously, so a slot is always drained. A transport with a real
-    // transmit queue must report it: returning true unconditionally lets
-    // close_client() tear a slot down inside the frame that asked for it.
+    // A queued transport must report whether its slot is drained to prevent
+    // close_client() tearing it down inside the requesting frame.
     bool slot_drained(const ConsumerSlot& /*slot*/) const override {
         return true;
     }
@@ -96,9 +79,7 @@ int main() {
                 pico_http::ADVERTISED_RX_WINDOW,
                 static_cast<std::size_t>(Profile::Limits::MAX_BUFFERED_BODY));
 
-    // The shipped double satisfies the same seam, from the installed package
-    // alone. Constructing it is what proves the archive linked, not just that
-    // the header was found.
+    // Construction checks archive linkage as well as installed headers.
     pico_http::testing::FakeTcpTransport fake;
     if (!fake.listen(80)) {
         std::puts("the shipped test double did not come through the package");
@@ -112,15 +93,8 @@ int main() {
         return 1;
     }
 
-    // The layout check this file exists for, and the only thing that actually
-    // runs it. The two static_asserts above read ADVERTISED_RX_WINDOW and
-    // MAX_BUFFERED_BODY; HttpService's constructor compares the *caller's*
-    // ProfileBinding -- its named knobs, and conn_size and conn_align, which
-    // every other profile and parser knob reaches -- against the one the
-    // archive was built with, and aborts on any disagreement. A definition that
-    // stops propagating to a consumer translation unit is caught here and
-    // nowhere else in this file: without this construction the smoke compiled,
-    // linked, printed and exited 0 while the layouts disagreed.
+    // Construction compares the consumer layout with the archive, including
+    // profile fields not checked by the assertions above.
     pico_http::HttpService service(
         std::make_unique<pico_http::testing::FakeTcpTransport>());
     if (!service.start(80)) {

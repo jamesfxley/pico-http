@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// A custom profile, which must satisfy the concept the service is sized by.
+// The custom profile must satisfy the service sizing concept.
 #include <cstddef>
 #include <pico_http/config/profile.hpp>
 #include <pico_http/config/sizing.hpp>
