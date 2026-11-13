@@ -1,4 +1,3 @@
-# Library-owned scope configuration inheriting the House-synced root.
 InheritParentConfig: true
 
 Checks: >
@@ -7,10 +6,6 @@ Checks: >
   -cppcoreguidelines-pro-type-vararg,
   -readability-magic-numbers
 
-# The benchmark reports over stdio with printf/snprintf into stack char
-# buffers, so the three C-array/vararg checks fire on every report line; the
-# alternative (iostreams or std::format) pulls in allocation and code size that
-# the firmware image is measured against by the footprint gate. Literal sizes
-# and durations are the benchmark's parameters, not constants shared with
-# anything else, so naming them adds indirection without removing a magic
-# number.
+# Stack-based stdio formatting avoids extra firmware allocation and code size.
+# Benchmark literals keep parameters at their use.
+# docs/deviations.md registers the four check exceptions.

@@ -18,12 +18,8 @@
 #include "lwipopts.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdio.h"
-// pico/stdlib.h is the SDK's documented public entry point, and provides
-// tight_loop_contents and the cyw43 board constants used below.
-// include-cleaner names the headers that physically declare them --
-// pico/platform/common.h, boards/<board>.h, cyw43_ll.h -- none of which
-// can be included standalone, and the board one would pin the image to
-// one board.
+// misc-include-cleaner: pico/stdlib.h supplies board constants and
+// tight_loop_contents through headers that cannot stand alone.
 // NOLINTNEXTLINE(misc-include-cleaner)
 #include "pico/stdlib.h"
 #include "pico/time.h"
@@ -38,11 +34,8 @@
 #include "pico_util/heap/heap_watermark.hpp"
 
 /// \file main.cpp
-/// Benchmark firmware for pico-http: HttpService over
-/// LwipTcpTransport. Exposes the endpoints host-side bench.py drives, plus
-/// /limits (spec OR-3) and a post-init heap-allocation counter (AR-1) so the
-/// static-footprint claims are checkable at runtime, not just by inspection.
-/// See README.md for the endpoint contract.
+/// Benchmark firmware with limits and post-init heap tracking (OR-3, AR-1).
+/// The endpoint contract is in README.md.
 
 using pico_http::Disposition;
 using pico_http::HTTPRequestView;
@@ -54,21 +47,20 @@ using pico_http::StaticBody;
 namespace {
 
 constexpr uint16_t HTTP_PORT = 80;
-constexpr uint32_t PAYLOAD_MAX_BYTES = 256U * 1024U;  // PR-8: no size ceiling
+// Largest /payload/<n> and /stream/<n> size in bytes; it exceeds the TX
+// ring capacity (PR-8).
+constexpr uint32_t PAYLOAD_MAX_BYTES = 256U * 1024U;
 constexpr std::string_view PAYLOAD_PREFIX = "/payload/";
 constexpr std::string_view STREAM_PREFIX = "/stream/";
 constexpr std::string_view BENCH_STATIC_PREFIX = "/bench/static/";
 constexpr std::string_view BENCH_BUFFERED_PREFIX = "/bench/buffered/";
-// Upper bound for the /bench body-mode routes: the P8-RP2350 buffered-body cap.
-// /bench/buffered/<n> answers 413 above the active profile's own cap, which the
-// library would refuse as a copied body (BR-14).
+// The largest /bench body, in bytes, matches the P8-RP2350 copied-body cap.
+// /bench/buffered/<n> answers 413 above the active profile's cap (BR-14).
 constexpr std::size_t BENCH_BODY_MAX = 8192;
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 500;
 
-// The per-slot sizes the specification states for this target, pinned so a
-// layout change fails this build until the specification moves with it (AR-1).
-// They hold for the configuration the specification's tables describe: the
-// 64 B / 256 B header caps, under either named profile.
+// The layout budgets apply to 64 B names and 256 B values under either named
+// profile (AR-1).
 #if PICO_HTTP_MAX_HEADER_NAME == 64 && PICO_HTTP_MAX_HEADER_VALUE == 256
 namespace layout {
 using Profile = PICO_HTTP_ACTIVE_PROFILE;
@@ -93,63 +85,37 @@ static_assert(pico_http::TX_RING_CAPACITY == 5840,
 }  // namespace layout
 #endif
 
-// Largest response-formatting buffer any route may put on the stack.
-//
-// Recorded because nothing else observes it. Route handlers run on the main
-// stack, on top of the cyw43 -> lwIP -> transport -> parser -> dispatch chain,
-// and the footprint gate measures .data/.bss and flash only — a stack frame
-// is invisible to it, so the largest one this image contains is bounded here or
-// nowhere (CXX-11.4). PICO_STACK_SIZE defaults to 0x800 and the descending
-// stack is backed by the 4 KiB SCRATCH_Y region, with PICO_USE_STACK_GUARDS
-// off by default, so an overflow is silent.
-//
-// This is a budget, not a measurement: no device run backs it. It is set at the
-// largest buffer the routes currently need so that adding a bigger one is a
-// build failure and a decision, rather than a silent step towards the edge.
+// The largest response-formatting buffer a route may put on the stack, in
+// bytes. The footprint gate does not measure stack frames. This budget has
+// no device measurement. Stack guards default off, so overflow can be silent.
 constexpr std::size_t HANDLER_STACK_BUDGET = 1536;
-// The main loop's poll period, and therefore the latency floor of every
-// deferred response: a request parked by the callback waits here until the next
-// pass. It must stay small next to the work being deferred, or a measurement of
-// deferral reports this constant instead. At the previous 50 ms a 10 ms burn
-// cost ~62 ms end to end -- five parts loop to one part handler -- which
-// throttled t19's deferred arm to roughly a quarter of the load its
-// synchronous arm carried and inflated the improvement it appeared to buy.
+// The main-loop poll period in ms must stay small beside the deferred work,
+// or it dominates measured deferral latency.
 constexpr uint32_t LOOP_POLL_MS = 1;
 
-// Linker-provided heap bounds (Pico SDK layout) for a free-heap estimate.
+// Linker bounds provide the free-heap estimate.
 extern "C" {
-// Both names are fixed by the SDK linker script, so neither the reserved
-// double-underscore prefix nor the case style is ours to change.
+// bugprone-reserved-identifier, readability-identifier-naming: the SDK linker
+// script fixes __StackLimit.
 // NOLINTNEXTLINE(bugprone-reserved-identifier,readability-identifier-naming)
 extern char __StackLimit;
-// Fixed by the SDK linker script, as above.
+// bugprone-reserved-identifier, readability-identifier-naming: the SDK linker
+// script fixes __bss_end__.
 // NOLINTNEXTLINE(bugprone-reserved-identifier,readability-identifier-naming)
 extern char __bss_end__;
 }
 
-// Post-init heap-growth tracking (AR-1) comes from pico-util, which owns the
-// requirement as pico_util:MR-1 (pico_util/heap/heap_watermark.hpp explains the
-// mallinfo proxy and why a per-alloc hook isn't available under the Pico SDK).
-// The static-body and generator response paths (used by /ping and /payload)
-// touch no heap per request; only the copied set_body() path allocates: one
-// exact-sized buffer per response, which the connection slot frees once the
-// response is sent. Live copied-body heap is therefore at most one body per
-// connection in flight, bounded by MAX_CONNECTIONS * MAX_BUFFERED_BODY, and
-// zero once the connections are idle.
-// The watermark is armed after start() and sampled by /stats, so it is mutable
-// by construction. Every steady-state access is in the async-context callback
-// — arm() from /stats/reset and growth_bytes() from /stats — with only the
-// one-time arm() in main() outside it, so the callers agree with each other
-// without a lock. Adding a caller from the main loop would need the same
-// cyw43_arch_lwip_begin()/end() bracket pump_deferred_work uses.
+// The heap tracker samples post-init growth (AR-1, pico_util:MR-1).
+// Steady-state calls run in the async context; a main-loop caller would need
+// cyw43_arch_lwip_begin()/end().
+// cppcoreguidelines-avoid-non-const-global-variables: the tracker is armed
+// after start() and updated by callbacks.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 pico_util::HeapWatermark g_heap;
 
 uint32_t free_heap_bytes() {
-    // Both symbols are placed by the SDK linker script to bracket the heap,
-    // so the distance between them is the heap size. The analyzer cannot see
-    // that they name positions in one region rather than two objects, and
-    // there is no way to express a linker-defined extent that it can.
+    // clang-analyzer-security.PointerSub: the linker symbols bound one heap
+    // region, which the analyser cannot infer.
     // NOLINTNEXTLINE(clang-analyzer-security.PointerSub)
     auto total = static_cast<uint32_t>(&__StackLimit - &__bss_end__);
     return total -
@@ -165,8 +131,8 @@ uint32_t post_init_heap_growth_bytes() {
 void blink_forever(uint32_t interval_ms) {
     bool led_on = false;
     while (true) {
-        // Board constant from the cyw43 headers pico/stdlib.h pulls in; see
-        // the note on that include.
+        // misc-include-cleaner: pico/stdlib.h supplies the CYW43 board
+        // constant.
         // NOLINTNEXTLINE(misc-include-cleaner)
         cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
         led_on = !led_on;
@@ -194,9 +160,10 @@ void connect_wifi() {
     cyw43_arch_enable_sta_mode();
     PICO_LOG_INFO << "Connecting to Wi-Fi SSID '" << SSID << "'...";
 
-    // From the cyw43 headers pico/stdlib.h pulls in; see the note on that
-    // include. Hoisted to its own statement so clang-format cannot wrap the
-    // call and separate this justification from the suppression below it.
+    // misc-include-cleaner: pico/stdlib.h supplies the CYW43 constant through
+    // headers that cannot stand alone. The constant has its own statement.
+    // This keeps clang-format from separating this justification from the
+    // suppression on the next line.
     // NOLINTNEXTLINE(misc-include-cleaner)
     const auto auth = CYW43_AUTH_WPA2_AES_PSK;
     while (cyw43_arch_wifi_connect_timeout_ms(PICO_HTTP_WIFI_SSID,
@@ -211,11 +178,8 @@ void connect_wifi() {
     PICO_LOG_INFO << "Wi-Fi connected, IP address: " << ip;
 }
 
-// Resumable body producer for /payload: the deterministic alphabet pattern the
-// host verifies, body[i] = 'A' + i % 26, computed purely from the byte offset.
-// Because it is a pure function of the offset (no cursor), the response writer
-// can stream a body of any size through a fixed scratch buffer with zero heap
-// (AR-5), and partial sends / retransmits re-read it safely.
+// The alphabet pattern depends only on byte offset, allowing resumption in
+// fixed storage (AR-5).
 std::size_t payload_generator(void* /*ctx*/, std::size_t offset,
                               std::span<std::uint8_t> out) {
     for (std::size_t i = 0; i < out.size(); ++i) {
@@ -242,27 +206,21 @@ Disposition handle_payload(const HTTPRequestView& req, HTTPResponse& res) {
         return Disposition::COMPLETE;
     }
 
-    // Stream the pattern through the generator API — no per-response heap and
-    // no size ceiling, so a download is bounded by the transfer rather than by
-    // a buffer.
     res.set_body_generator(payload_generator, nullptr, requested,
                            "application/octet-stream");
     return Disposition::COMPLETE;
 }
 
-// Length-less variant of payload_generator for /stream: emits the same
-// body[i] = 'A' + i % 26 pattern but signals end-of-body by returning 0 once
-// `offset` reaches the target size. The size is carried by value in the ctx
-// pointer (no per-response storage to outlive the handler, and no cross-slot
-// sharing) — the generator never dereferences it.
+// The context pointer carries the length by value and is never dereferenced,
+// avoiding per-request storage.
 std::size_t stream_generator(void* ctx, std::size_t offset,
                              std::span<std::uint8_t> out) {
-    // Recovers the size handle_stream() packed into the opaque ctx pointer;
-    // never dereferenced.
+    // cppcoreguidelines-pro-type-reinterpret-cast: the opaque pointer carries
+    // a size and is never dereferenced.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
     auto total = reinterpret_cast<std::uintptr_t>(ctx);
     if (offset >= total) {
-        return 0;  // end-of-body
+        return 0;
     }
     const std::size_t n = std::min<std::size_t>(out.size(), total - offset);
     for (std::size_t i = 0; i < n; ++i) {
@@ -271,9 +229,8 @@ std::size_t stream_generator(void* ctx, std::size_t offset,
     return n;
 }
 
-// GET /stream/<size> — same bytes as /payload/<size> but framed with
-// Transfer-Encoding: chunked (NR-6), exercising the length-less generator path
-// on device. Zero per-response heap, same as /payload.
+// The unknown-length route exercises chunked framing without per-response
+// heap (NR-6).
 Disposition handle_stream(const HTTPRequestView& req, HTTPResponse& res) {
     const std::string_view size_str = req.uri.substr(STREAM_PREFIX.size());
     uint32_t requested = 0;
@@ -292,19 +249,16 @@ Disposition handle_stream(const HTTPRequestView& req, HTTPResponse& res) {
         return Disposition::COMPLETE;
     }
 
-    // The generator context is an opaque void*; this route carries the
-    // requested length in it rather than pointing at per-request storage.
+    // cppcoreguidelines-pro-type-reinterpret-cast, performance-no-int-to-ptr:
+    // the opaque pointer carries the requested size, not an address.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast,performance-no-int-to-ptr)
     void* ctx = reinterpret_cast<void*>(static_cast<std::uintptr_t>(requested));
     res.set_body_generator(stream_generator, ctx, "application/octet-stream");
     return Disposition::COMPLETE;
 }
 
-// Fixed alphabet body backing the /bench body-mode routes; the same
-// body[i] = 'A' + i % 26 pattern as /payload, materialised once in static
-// storage so STATIC_VIEW can reference it with no per-request work.
-// The g_ prefix marks file-scope storage, matching the other globals here;
-// this is not a compile-time constant.
+// readability-identifier-naming: g_ marks file-scope storage, as on g_heap.
+// The table is const but not declared constexpr.
 // NOLINTNEXTLINE(readability-identifier-naming)
 const std::array<std::uint8_t, BENCH_BODY_MAX> g_bench_body = [] {
     std::array<std::uint8_t, BENCH_BODY_MAX> body{};
@@ -314,8 +268,8 @@ const std::array<std::uint8_t, BENCH_BODY_MAX> g_bench_body = [] {
     return body;
 }();
 
-// Parse a positive decimal size from `uri` after `prefix`, bounded by `max`.
-// Returns 0 for any malformed, zero, or out-of-range value.
+// Return the positive size after the URI prefix, or zero if invalid or over
+// max.
 std::uint32_t parse_bench_size(std::string_view uri, std::string_view prefix,
                                std::uint32_t max) {
     const std::string_view size_str = uri.substr(prefix.size());
@@ -336,10 +290,7 @@ void bench_bad_request(HTTPResponse& res) {
     res.set_body(R"({"error":"size must be 1..8192"})", "application/json");
 }
 
-// GET /bench/static/<n> and /bench/buffered/<n> serve the identical n-byte
-// body through the STATIC_VIEW and BUFFERED body modes respectively, so bench
-// t17 can isolate the buffered mode's extra copy against a static baseline on
-// one held-constant payload. n <= BENCH_BODY_MAX.
+// The two body modes use identical bytes to isolate copy cost in t17.
 Disposition handle_bench_static(const HTTPRequestView& req, HTTPResponse& res) {
     const std::uint32_t n =
         parse_bench_size(req.uri, BENCH_STATIC_PREFIX,
@@ -393,7 +344,7 @@ Disposition handle_upload(const HTTPRequestView& req, HTTPResponse& res) {
     return Disposition::COMPLETE;
 }
 
-// OR-2: the counter set as JSON.
+// The counters are served as JSON (OR-2).
 void handle_stats(const HttpService& server, HTTPResponse& res) {
     const HttpService::Statistics& stats = server.statistics();
     const LwipTcpTransport::LockHoldStats lock =
@@ -401,15 +352,11 @@ void handle_stats(const HttpService& server, HTTPResponse& res) {
     const LwipTcpTransport::ReceiveStats receive =
         LwipTcpTransport::receive_stats();
     auto uptime = to_ms_since_boot(get_absolute_time());
-    // Widened once here rather than cast at the call: uint32_t is already
-    // unsigned long on this target, so a cast there is a no-op that
-    // -Wuseless-cast rejects, while an implicit conversion stays correct on a
-    // target where the two differ.
-    // unsigned long, not uint32_t: these feed %lu in the snprintf below, and
-    // the fixed-width type is what google-runtime-int would have here.
+    // Widening here avoids a -Wuseless-cast when uint32_t is unsigned long.
+    // google-runtime-int: unsigned long matches snprintf %lu.
     // NOLINTNEXTLINE(google-runtime-int)
     const unsigned long free_heap = free_heap_bytes();
-    // Same, for the same format specifier.
+    // google-runtime-int: unsigned long matches snprintf %lu.
     // NOLINTNEXTLINE(google-runtime-int)
     const unsigned long heap_growth = post_init_heap_growth_bytes();
 
@@ -492,7 +439,7 @@ void handle_stats(const HttpService& server, HTTPResponse& res) {
 }
 
 void handle_limits(const HttpService& server, HTTPResponse& res) {
-    using Limits = HttpService::Limits;  // active profile's caps
+    using Limits = HttpService::Limits;
     const HttpService::TimeoutConfig& timeouts = server.timeout_config();
     const HttpService::KeepAliveConfig& ka = server.keep_alive_config();
     static_assert(512 <= HANDLER_STACK_BUDGET);
@@ -521,7 +468,7 @@ void handle_limits(const HttpService& server, HTTPResponse& res) {
                  "application/json");
 }
 
-// OR-4: build and profile identity.
+// The response identifies the build and profile (OR-4).
 void handle_info(const HttpService& server, HTTPResponse& res) {
     const HttpService::KeepAliveConfig& ka = server.keep_alive_config();
 
@@ -538,8 +485,8 @@ void handle_info(const HttpService& server, HTTPResponse& res) {
         PICO_HTTP_BENCH_VERSION, PICO_HTTP_BENCH_BOARD, PICO_HTTP_BENCH_PROFILE,
         PICO_HTTP_BENCH_BUILD_TYPE, pico_http::TX_RING_CAPACITY,
         HttpService::MAX_CONNECTIONS, static_cast<unsigned>(MEMP_NUM_TCP_PCB),
-        // PR-9's ceiling is a multiple of the configured initial RTO, so the
-        // harness reads the value in force rather than assuming lwIP's default.
+        // The driver uses the configured initial RTO for its send-gap
+        // expectation (PR-9).
         static_cast<unsigned>(LWIP_TCP_RTO_TIME), ka.enabled ? "true" : "false",
         static_cast<unsigned long>(ka.idle_timeout_seconds),
         static_cast<unsigned long>(ka.max_requests_per_connection),
@@ -548,24 +495,16 @@ void handle_info(const HttpService& server, HTTPResponse& res) {
                  "application/json");
 }
 
-// Dumps lwIP's own heap/pool high-water marks (LWIP_STATS): `mem.max` is the
-// peak bytes ever live in lwIP's MEM_SIZE heap, and each pool's `max` is the
-// peak entries used, so the bounds the reference sizes MEM_SIZE,
-// PBUF_POOL_SIZE, MEMP_NUM_TCP_SEG and MEMP_NUM_PBUF by are checked against
-// real load. `pbuf_ref` is
-// MEMP_PBUF: the PBUF_ROM header the zero-copy TX path takes for every segment
-// it hands lwIP from the ring. `err` is non-zero only if an
-// allocation was ever refused — the signal that a value was set too low.
+// LWIP_STATS supplies heap/pool peaks and allocation failures. pbuf_ref names
+// the MEMP_PBUF pool used for PBUF_ROM headers.
 void handle_lwip_stats(HTTPResponse& res) {
     const struct stats_mem& mem = lwip_stats.mem;
     const struct stats_mem& pbuf = *lwip_stats.memp[MEMP_PBUF_POOL];
     const struct stats_mem& seg = *lwip_stats.memp[MEMP_TCP_SEG];
     const struct stats_mem& pcb = *lwip_stats.memp[MEMP_TCP_PCB];
     const struct stats_mem& ref = *lwip_stats.memp[MEMP_PBUF];
-    // TCP protocol counters, not pool counters. lwIP keeps no retransmit
-    // counter, so these bound the question rather than answering it: xmit
-    // against recv, and drop/memerr, say whether the stack shed anything when
-    // one connection freezes and the rest stay healthy.
+    // TCP counters record protocol activity separately from pool allocation
+    // failures.
     const struct stats_proto& tcp = lwip_stats.tcp;
 
     static_assert(768 <= HANDLER_STACK_BUDGET);
@@ -608,46 +547,32 @@ void handle_lwip_stats(HTTPResponse& res) {
                  "application/json");
 }
 
-// t19: the same CPU-heavy work in both shapes, so a bench run can price what
-// deferral buys on the hot path.
-//
-// /heavy/<ms> burns the time inside the handler, which runs in the lwIP
-// callback — every other connection's network processing waits behind it.
-// /heavy-deferred/<ms> parks the request (AR-9) and burns the identical time in
-// the main loop, off the async-context path. /ping latency measured against
-// each is the difference the deferred API makes at this version, before any
-// second core is involved.
+// The synchronous route burns inside the lwIP callback. The deferred route
+// runs the same work in the main loop (AR-9).
 constexpr std::string_view HEAVY_PREFIX = "/heavy/";
 constexpr std::string_view HEAVY_DEFERRED_PREFIX = "/heavy-deferred/";
 constexpr std::uint32_t HEAVY_MAX_MS = 1000;
 
-// Sized to the BR-12 cap: a deferral past the cap is refused with 503 before
-// the handler runs, so this can never be the tighter of the two limits.
+// The work table matches the deferral cap (BR-12).
 constexpr std::size_t MAX_DEFERRED_WORK = HttpService::MAX_PENDING;
 
 struct DeferredWork {
-    // The request-scoped handle, which is all a deferring handler keeps (AR-9).
-    // Deliberately not a pointer to the response: that object belongs to the
-    // service and is gone the moment the handler returns.
+    // The RequestId outlives the discarded response object (AR-9).
     pico_http::RequestId id;
     std::uint32_t started_ms = 0;
     std::uint32_t burn_ms = 0;
     bool held = false;
 };
 
-// The filler the service invokes at completion time, against a response it
-// hands us then — not one we kept. This is the pattern a consumer copies.
 void fill_heavy_deferred(void* /*ctx*/, HTTPResponse& res) {
     res.set_body_static(StaticBody::outliving_response("heavy"), "text/plain");
 }
 
-// Owned by main() and threaded through by reference: the handler runs in the
-// lwIP callback and only records here, while pump_deferred_work() below is the
-// only thing that burns time or responds.
+// The callback records work in this main-owned table. pump_deferred_work()
+// burns time and completes it.
 using DeferredWorkTable = std::array<DeferredWork, MAX_DEFERRED_WORK>;
 
-// Parse the trailing <ms> of a heavy route. Returns 0 when out of range, which
-// the caller reports as 400.
+// Return the requested duration in ms, or zero for the caller to answer 400.
 std::uint32_t parse_burn_ms(std::string_view uri, std::string_view prefix) {
     const std::string_view ms_str = uri.substr(prefix.size());
     std::uint32_t ms = 0;
@@ -659,10 +584,7 @@ std::uint32_t parse_burn_ms(std::string_view uri, std::string_view prefix) {
     return valid ? ms : 0;
 }
 
-// busy_wait_us rather than a hand-rolled spin: it is pico/time.h's own API for
-// exactly this, so it needs no suppression for an SDK symbol whose declaring
-// header is not includable standalone, and it is wrap-correct by construction
-// (AR-7) instead of by a signed-difference loop written here.
+// The SDK wait handles timer wrap (AR-7).
 void burn_cpu(std::uint32_t ms) {
     constexpr std::uint32_t US_PER_MS = 1000;
     busy_wait_us(static_cast<std::uint64_t>(ms) * US_PER_MS);
@@ -675,7 +597,7 @@ void bad_burn_request(HTTPResponse& res) {
     res.set_body(R"({"error":"ms must be 1..1000"})", "application/json");
 }
 
-// Synchronous: burns inside the lwIP callback.
+// The synchronous work runs inside the lwIP callback.
 Disposition handle_heavy(const HTTPRequestView& req, HTTPResponse& res) {
     const std::uint32_t ms = parse_burn_ms(req.uri, HEAVY_PREFIX);
     if (ms == 0) {
@@ -687,8 +609,7 @@ Disposition handle_heavy(const HTTPRequestView& req, HTTPResponse& res) {
     return Disposition::COMPLETE;
 }
 
-// Deferred: records the work and returns immediately, so the callback path is
-// free while the main loop burns the time (AR-9).
+// The callback returns before the main loop burns time (AR-9).
 Disposition handle_heavy_deferred(DeferredWorkTable& table,
                                   const HTTPRequestView& req,
                                   HTTPResponse& res) {
@@ -705,39 +626,21 @@ Disposition handle_heavy_deferred(DeferredWorkTable& table,
         work.burn_ms = ms;
         work.started_ms = to_ms_since_boot(get_absolute_time());
         work.held = true;
-        // Nothing is written to `res` here: a deferring handler's response is
-        // discarded, and fill_heavy_deferred supplies the body at completion.
+        // The pending response is discarded; the completion filler supplies
+        // its body.
         return Disposition::PENDING;
     }
-    // Unreachable while MAX_DEFERRED_WORK == MAX_PENDING: BR-12 would have
-    // refused this request with 503 before the handler ran, and this scan runs
-    // inside the async-context lock, so the main loop cannot be releasing a
-    // slot underneath it. Answering inline rather than asserting keeps the
-    // bench firmware serving if either of those ever stops holding.
+    // An occupied work table falls back to an inline response instead of
+    // another deferral (BR-12).
     burn_cpu(ms);
     res.set_body_static(StaticBody::outliving_response("heavy"), "text/plain");
     return Disposition::COMPLETE;
 }
 
-// Resolve any parked heavy work. Called from the main loop, so the burn happens
-// off the callback path — which is the whole point of the comparison.
-//
-// The table is shared state. handle_heavy_deferred writes it from the
-// async-context worker, which under pico_cyw43_arch_lwip_threadsafe_background
-// is a low-priority interrupt that preempts this loop; the accesses here are
-// therefore bracketed by cyw43_arch_lwip_begin()/end() (CXX-08.1). The handler
-// itself already runs inside that lock and needs no bracket of its own.
-//
-// Two properties the bracketing alone would not give:
-//
-//   - The burn happens *outside* the lock. Holding it across the burn would
-//     stall the network for exactly the duration this design exists to move off
-//     the callback path.
-//   - `id` and `burn_ms` are copied out before the slot is released, and the
-//     response is sent against the copy. Reading work.id after clearing
-//     work.held let a request arriving in that window claim the slot and be
-//     answered without its own burn ever running, while the request that
-//     actually owned the slot was never resolved and hung to TR-6.
+// The async lock protects the table from callback pre-emption. The burn runs
+// outside the lock to keep network processing active. id and burn_ms are
+// copied before release so replacement cannot misdirect a reply and strand
+// the original request until timeout (TR-6).
 void pump_deferred_work(HttpService& server, DeferredWorkTable& table) {
     for (DeferredWork& work : table) {
         pico_http::RequestId id{};
@@ -759,24 +662,19 @@ void pump_deferred_work(HttpService& server, DeferredWorkTable& table) {
         work.held = false;
         cyw43_arch_lwip_end();
 
-        // Ignoring the result: false means the request went away while the
-        // work ran (timeout, reset, or the connection moved on), which is the
-        // expected race and needs no handling here — the filler simply never
-        // runs (AR-9).
+        // A request can expire while work runs. A false result needs no
+        // recovery and the filler does not run (AR-9).
         static_cast<void>(server.respond(id, &fill_heavy_deferred, nullptr));
     }
 }
 
-// Registration only fails if a pattern exceeds RouteTable's fixed capacity,
-// which is a fixed property of the literals below — so a failure here is a
-// build-time mistake in this file, reported at boot rather than served as a
-// silent 404. Returns false if any route was rejected.
+// Returns false if a route literal is rejected; boot reports the failure.
 bool register_routes(HttpService& server, DeferredWorkTable& deferred_work) {
     bool ok = true;
     ok = server.add_route("GET", "/ping",
                           [](const HTTPRequestView&, HTTPResponse& res) {
-                              // Static literal: no copy before the ring,
-                              // zero-heap hot path (AR-2).
+                              // The literal needs no copy before the ring
+                              // (AR-2).
                               res.set_body_static(
                                   StaticBody::outliving_response("pong"),
                                   "text/plain");
@@ -786,7 +684,7 @@ bool register_routes(HttpService& server, DeferredWorkTable& deferred_work) {
 
     ok = server.add_route("GET", "/payload/*", handle_payload) && ok;
 
-    // t19: the CPU-heavy pair (AR-9).
+    // The paired routes compare synchronous and deferred work (AR-9).
     ok = server.add_route("GET", "/heavy/*", handle_heavy) && ok;
     ok = server.add_route(
              "GET", "/heavy-deferred/*",
@@ -819,14 +717,13 @@ bool register_routes(HttpService& server, DeferredWorkTable& deferred_work) {
     ok = server.add_route(
              "POST", "/stats/reset",
              [&server](const HTTPRequestView&, HTTPResponse& res) {
-                 // The connections open as the counters zero,
-                 // this one included: a soak needs them to check
-                 // that accepts and disconnects balance (RR-4).
+                 // Connections open at reset still contribute later
+                 // disconnects (RR-4).
                  const std::size_t open = server.active_connections();
                  server.reset_statistics();
                  LwipTcpTransport::reset_lock_hold_stats();
                  LwipTcpTransport::reset_receive_stats();
-                 arm_heap_growth_tracking();  // re-baseline
+                 arm_heap_growth_tracking();
                  std::array<char, 48> buf{};
                  const int len = std::snprintf(
                      buf.data(), buf.size(),
@@ -876,9 +773,8 @@ int main() {
 
     DeferredWorkTable deferred_work{};
 
-    // Heap-allocate the service: sizeof(HttpService) is ~122 KB (eight
-    // per-connection slots, each holding the parser, RX assembly buffer, and
-    // response-writer buffers inline), far too large to sit on main()'s stack.
+    // The inline connection buffers make HttpService too large for the main
+    // stack.
     auto server_ptr =
         std::make_unique<HttpService>(std::make_unique<LwipTcpTransport>());
     HttpService& server = *server_ptr;
@@ -894,8 +790,8 @@ int main() {
     }
     PICO_LOG_INFO << "Benchmark server listening on port " << HTTP_PORT;
 
-    // Everything above (route registration, service/transport construction)
-    // is the one-time AR-1 init budget; baseline the heap-growth tracker now.
+    // Heap tracking begins after service construction and route registration
+    // (AR-1).
     arm_heap_growth_tracking();
 
     bool led_on = false;
@@ -907,8 +803,7 @@ int main() {
             cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, led_on);
             last_toggle = now;
         }
-        // Off the async-context path: this is where a deferred handler's work
-        // actually happens (AR-9), and what t19 measures against /heavy.
+        // The main loop runs deferred work outside the async callback (AR-9).
         pump_deferred_work(server, deferred_work);
         sleep_ms(LOOP_POLL_MS);
     }
