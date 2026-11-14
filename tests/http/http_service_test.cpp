@@ -394,6 +394,24 @@ TEST(HttpServiceTest, Http11WithoutHostReturns400) {
     EXPECT_TRUE(response.starts_with("HTTP/1.1 400 Bad Request\r\n"));
 }
 
+// The boundary response is the same bytes whichever way it is built (AR-13,
+// BR-8, BR-11).
+TEST(HttpServiceTest, ABoundaryResponseHasAFixedHeadAndTheReasonAsBody) {
+    Harness harness;
+    const ConnectionId bad = harness.wire->connect();
+    EXPECT_EQ(round_trip(harness, bad, "GET /x\r\n\r\n"),
+              "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+              "Content-Length: 11\r\nConnection: close\r\nServer: pico\r\n"
+              "\r\nBad Request");
+
+    const ConnectionId version = harness.wire->connect();
+    EXPECT_EQ(round_trip(harness, version, "GET /x HTTP/2.0\r\n\r\n"),
+              "HTTP/1.1 505 HTTP Version Not Supported\r\n"
+              "Content-Type: text/plain\r\nContent-Length: 26\r\n"
+              "Connection: close\r\nServer: pico\r\n\r\n"
+              "HTTP Version Not Supported");
+}
+
 TEST(HttpServiceTest, UnsupportedHttpVersionReturns505) {
     Harness harness;
     const ConnectionId id = harness.wire->connect();

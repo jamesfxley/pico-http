@@ -414,8 +414,11 @@ TEST(DeferredTest, DeferralCapAnswers503AndRecoversWhenOneResolves) {
     fixture.harness.flush(refused);
 
     const std::string sent = fixture.harness.wire->sent_text(refused);
-    EXPECT_NE(sent.find("503 Service Unavailable"), std::string::npos) << sent;
-    EXPECT_NE(sent.find("Connection: close"), std::string::npos) << sent;
+    // The exact bytes pin the boundary response's head and body (AR-13).
+    EXPECT_EQ(sent,
+              "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\n"
+              "Content-Length: 19\r\nConnection: close\r\nServer: pico\r\n"
+              "\r\nService Unavailable");
 
     const auto& stats = fixture.harness.service->statistics();
     EXPECT_EQ(stats.deferrals_refused, 1U);

@@ -205,7 +205,10 @@ budget (AR-1).
 
 Copied `set_body()` is the bounded exception (AR-1, BR-14). Static and
 generated bodies allocate nothing. Response entries contain several KiB of
-headers, so the service-wide pool keeps them off the callback stack. An entry
+headers, so the service-wide pool keeps them off the callback stack, and
+boundary responses (every BR-1..BR-11 rejection that answers with a status,
+and every `503`) write a fixed head into the connection's writer without
+building an entry (AR-13). An entry
 is held for one dispatch or completion, never across a deferral, so the pool
 is sized by concurrent turns; the service counts the BR-12 deferral cap
 separately. FlatMap keeps entries stationary. Releasing or resetting an entry

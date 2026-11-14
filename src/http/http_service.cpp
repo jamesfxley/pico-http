@@ -112,14 +112,14 @@ constexpr std::string_view REASON_505 = "HTTP Version Not Supported";
 // Service-unavailable response code (BR-12).
 constexpr std::uint16_t STATUS_SERVICE_UNAVAILABLE = 503U;
 
+constexpr std::size_t MAX_REASON_SIZE =
+    std::ranges::max({REASON_400.size(), REASON_405.size(), REASON_413.size(),
+                      REASON_414.size(), REASON_417.size(), REASON_431.size(),
+                      REASON_501.size(), REASON_503.size(), REASON_505.size()});
+
 // Reason phrases have to fit status_text because assign() cannot report
 // failure to the client.
-static_assert(std::ranges::max({REASON_400.size(), REASON_405.size(),
-                                REASON_413.size(), REASON_414.size(),
-                                REASON_417.size(), REASON_431.size(),
-                                REASON_501.size(), REASON_503.size(),
-                                REASON_505.size()}) <=
-                  HTTPResponse::STATUS_TEXT_CAPACITY,
+static_assert(MAX_REASON_SIZE <= HTTPResponse::STATUS_TEXT_CAPACITY,
               "every reason phrase must fit HTTPResponse::status_text");
 
 // Upper bound on distinct methods listed in a 405 Allow header. Covers the
@@ -949,20 +949,41 @@ void HttpService::begin_response(Conn& conn, const HTTPRequestView& request,
     }
 }
 
+void HttpService::begin_boundary_response(Conn& conn, std::uint16_t code,
+                                          std::string_view reason) {
+    // The longest head is the widest reason phrase and a two-digit body length
+    // in the fixed layout below.
+    constexpr std::size_t TWO_DIGIT_LIMIT = 100U;
+    static_assert(MAX_REASON_SIZE < TWO_DIGIT_LIMIT);
+    static_assert(
+        HEAD_CAPACITY >=
+            std::string_view("HTTP/1.1 000 \r\nContent-Type: text/plain\r\n"
+                             "Content-Length: 00\r\nConnection: close\r\n"
+                             "Server: pico\r\n\r\n")
+                    .size() +
+                MAX_REASON_SIZE,
+        "the profile's HEAD_CAPACITY must hold the longest boundary head");
+
+    // The head goes straight into the writer's buffer and the reason phrase is
+    // the body, so no HTTPResponse is built on the callback stack (AR-13).
+    HeadWriter head{conn.writer.head_buffer()};
+    head.put(HTTP_VERSION_11);
+    head.put_char(' ');
+    head.put_uint(code);
+    head.put_char(' ');
+    head.put(reason);
+    head.put("\r\nContent-Type: text/plain\r\nContent-Length: ");
+    head.put_uint(reason.size());
+    head.put("\r\nConnection: close\r\nServer: pico\r\n\r\n");
+    conn.closing = true;
+    // The head fits by the static_assert above. Every reason phrase is a
+    // string literal.
+    conn.writer.begin(head.length(), pico_util::as_bytes(reason));
+}
+
 void HttpService::serialize_error(Conn& conn, ParseResult error) {
     const ErrorInfo info = error_info(error);
-    HTTPResponse response;
-    response.status_code = info.code;
-    // info.text is one of the reason phrases the static_assert bounds.
-    static_cast<void>(response.status_text.assign(info.text));
-    // info.text is a string literal (static storage) — serve it without a copy.
-    response.set_body_static(StaticBody::outliving_response(info.text),
-                             "text/plain");
-
-    HTTPRequestView dummy;
-    dummy.version = HTTP_VERSION_11;
-    conn.closing = true;
-    begin_response(conn, dummy, response, /*close_connection=*/true);
+    begin_boundary_response(conn, info.code, info.text);
 
     ++(stats_.*info.counter);
     ++stats_.parse_errors;
@@ -970,18 +991,8 @@ void HttpService::serialize_error(Conn& conn, ParseResult error) {
 
 void HttpService::serialize_service_unavailable(Conn& conn) {
     // The rejection must not need an entry in the exhausted pool. No handler
-    // receives this stack response (BR-12).
-    HTTPResponse response;
-    response.status_code = STATUS_SERVICE_UNAVAILABLE;
-    // REASON_503 fits the statically checked reason-phrase capacity.
-    static_cast<void>(response.status_text.assign(REASON_503));
-    response.set_body_static(StaticBody::outliving_response(REASON_503),
-                             "text/plain");
-
-    HTTPRequestView dummy;
-    dummy.version = HTTP_VERSION_11;
-    conn.closing = true;
-    begin_response(conn, dummy, response, /*close_connection=*/true);
+    // receives this response (BR-12).
+    begin_boundary_response(conn, STATUS_SERVICE_UNAVAILABLE, REASON_503);
     // No parse_errors bump: the request was well formed and the server is out
     // of capacity, which is a different fact and gets its own counter (OR-1).
 }

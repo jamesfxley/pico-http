@@ -85,12 +85,18 @@ class ResponseWriter {
         head_len_ = head_len;
         head_sent_ = 0;
         body_.adopt(response);
-        body_sent_ = 0;
-        framing_ = framing;
-        generator_drained_ = false;
-        // The interim 100, if any, has already been delivered or is still
-        // draining; begin() must not disturb its cursor.
-        state_ = continue_pending() ? State::CONTINUE : State::HEAD;
+        start(framing);
+    }
+
+    /// Start emitting a response whose body is caller-owned bytes that outlive
+    /// it, sized by Content-Length. Needs no HTTPResponse, so a boundary
+    /// response builds none (AR-13).
+    void begin(std::size_t head_len,
+               std::span<const std::uint8_t> static_body) noexcept {
+        head_len_ = head_len;
+        head_sent_ = 0;
+        body_.adopt_static(static_body);
+        start(Framing::SIZED);
     }
 
     /// Use the serialised head without a body or last-chunk (BR-13, BR-14;
@@ -184,6 +190,15 @@ class ResponseWriter {
     }
 
    private:
+    void start(Framing framing) noexcept {
+        body_sent_ = 0;
+        framing_ = framing;
+        generator_drained_ = false;
+        // The interim 100, if any, has already been delivered or is still
+        // draining; begin() must not disturb its cursor.
+        state_ = continue_pending() ? State::CONTINUE : State::HEAD;
+    }
+
     // Hexadecimal chunk-size width in digits. Leading zeros are valid (NR-6;
     // RFC 9112 §7.1).
     static constexpr std::size_t CHUNK_SIZE_HEX_WIDTH = 4;

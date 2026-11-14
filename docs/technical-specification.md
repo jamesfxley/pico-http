@@ -270,6 +270,7 @@ rejection and the storage never disagree.
 | **AR-10** | **The application owns `lwipopts.h`.** This library asserts what it requires of a configuration and provides none. lwIP admits one configuration per image and the SDK compiles lwIP into whichever target links its INTERFACE libraries, so a library supplying one gives an application linking two networking libraries two lwIP builds whose struct layouts disagree, resolved by archive order (`CXX-10.3`). A firmware configure fails unless `PICO_LWIPOPTS_TARGET` names the application's target — the variable is the family's, so an application linking pico-http and a sibling names its configuration once. The requirements are §3.2, each a `static_assert` in a single translation unit, so an inadequate configuration is a compile error naming the setting rather than a fault under load. |
 | **AR-11** | **A caller-owned body declares its lifetime in its type.** `set_body_static` takes a `StaticBody`, which only `StaticBody::outliving_response()` constructs, and whose name is the caller's assertion, written at the call site rather than made silently by a conversion. A `std::span` or `std::string_view` does not convert, so a view into `HTTPRequestView` cannot be served as a static body. That storage is the connection's parser buffer, recycled when the handler returns, and the writer re-reads a static body on every backpressure resume -- potentially long after that. |
 | **AR-12** | **Configuration fails for a board without an RP2350 and the CYW43 radio.** The server runs over the radio, and pico-logging needs the RP2350's exclusive access, so the library declares `PLATFORM rp2350 CYW43` to pico-tooling's bootstrap, which fails the configure for a board without what a library declares. A consumer adding it on such a board fails at configure, naming what the board lacks, rather than in the build or on the device. Configuration therefore fails for the Pico W (RP2040) (FW-1). |
+| **AR-13** | **A boundary response is built without an `HTTPResponse`.** An `HTTPResponse` holds several KiB of headers, and the transport's receive callback runs on the core-0 stack, which the SDK default sizes at 2,048 B. Every parse rejection that answers with a status (BR-1..BR-11) and every `503`, whether from the BR-12 deferral cap or from a response-entry shortage, is therefore written as a fixed head into the connection's response writer, with the reason phrase as a static body, and places no `HTTPResponse` in any frame on that path. A peer chooses when a rejection happens, so the frame size cannot depend on traffic. |
 
 ## 5. Performance requirements (PR)
 
@@ -342,12 +343,13 @@ agree on and so cannot be set per-consumer.
 
 BR-12 is enforced where a handler returns `PENDING`, not on arrival: a request
 whose handler answers inline is never counted against it, so a saturated
-deferral cap cannot answer ordinary synchronous traffic with `503`. Boundary
-responses — BR-12's `503` and the BR-1..BR-11 parse rejections — are built in a
-stack-local `HTTPResponse` and serialised straight into the connection's
-response writer, so they need neither a deferral slot nor the heap. BR-12 is an
-overload condition rather than a malformed request, so it is counted separately
-(`deferrals_refused`, OR-1) and never in `parse_errors`.
+deferral cap cannot answer ordinary synchronous traffic with `503`. The cap's
+`503` is a boundary response: a fixed head written straight into the
+connection's response writer, with the reason phrase as a static body. It
+builds no `HTTPResponse` (AR-13), so it needs no deferral slot, no heap and no
+response on the callback stack. BR-12 is an overload condition rather than a
+malformed request, so it is counted separately (`deferrals_refused`, OR-1) and
+never in `parse_errors`.
 
 ## 8. Timing and timeout requirements (TR)
 
@@ -446,6 +448,7 @@ them; review checks these citations (EN-02.1).
 | AR-10 | `lwipopts_assertions.hpp` in `lwip_tcp_transport.cpp`; the `consumer` gate cases in `house.toml`; case `lwipopts-required` at producer-configure, expecting `PICO_LWIPOPTS_TARGET must name the target` | Every §3.2 relation is a `static_assert`; the configure fails with a diagnostic naming the variable; no target puts an `lwipopts.h` on the include path unless it is named |
 | AR-11 | Compiler; `pico_http_http_tests` -- `ARequestViewCannotBecomeAStaticBody` | `set_body_static(request.body, ...)` does not compile: `cannot convert 'std::span<const unsigned char>' to 'pico_http::StaticBody'`. The test asserts the property the diagnostic rests on -- that neither a span nor a string view converts -- so a conversion added later fails there rather than silently restoring the trap. |
 | AR-12 | the `consumer` gate cases `pico-w-refused` and `pico2-refused`, a consumer adding the library | On `pico_w` the configure fails saying `PICO_HTTP needs PICO_PLATFORM rp2350`; on `pico2`, saying `PICO_HTTP needs a board with the CYW43 radio` |
+| AR-13 | CTest `pico_http.StackUsage.BoundaryResponsesBuildNoHttpResponse`; `pico_http_http_tests` -- `ABoundaryResponseHasAFixedHeadAndTheReasonAsBody` | GCC's `-fstack-usage` report for `http_service.cpp`, compiled for the host without sanitiser instrumentation, lists no function with a frame over 1,024 B, so neither `serialize_error` nor `serialize_service_unavailable` holds an `HTTPResponse`; every rejection still answers its status, `Connection: close` and reason-phrase body |
 | PR-1 | t1 | **Network-measured; review.** t1 records latency percentiles (expectations p50 8 ms, p99 40 ms) and history comparisons. Review the same profile/build type, conditions and RF-health bursts for trends and jumps; no numerical miss fails the run. |
 | PR-2 | t1 | **Mixed. Device-internal (mechanised):** receive callbacks through first send require `receive_within_1ms / receive_samples >= 0.99` at 1 ms, with max recorded. **Network-measured (review):** TTFB p50 expectation 6 ms and its history comparison; whole-callback/radio-handoff timings stay recorded. Review the matched history and conditions, without a network-speed verdict. |
 | PR-3 | t5 | **Network-measured; review.** Record RPS at eight connections (expectation 250) and history comparison. Workload errors, RR-3 and Debug AR-3 remain mechanised. |
