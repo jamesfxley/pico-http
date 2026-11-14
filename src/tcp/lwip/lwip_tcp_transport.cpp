@@ -21,17 +21,12 @@
 #include "pico_http/config/sizing.hpp"
 #include "pico_http/tcp/tcp_transport.hpp"
 
-// AR-10: what this library requires of the application's lwipopts.h, in the one
-// translation unit that includes it. It names nothing this file uses: its
-// static_asserts are the reason to include it.
+// This translation unit checks the application's lwIP configuration (AR-10).
 #include "pico_http/lwipopts_assertions.hpp"  // IWYU pragma: keep
 
 /// \file lwip_tcp_transport.cpp
-/// lwIP raw-API implementation of ITcpTransport. See the header for the
-/// design rationale; the load-bearing detail is that tcp_arg() points at the
-/// per-connection Slot, so every callback — including tcp_err(), where lwIP
-/// has already freed the pcb — reaches connection state in O(1) and tears it
-/// down through one shared path.
+/// Firmware raw-TCP adapter. The header documents callback and buffer
+/// lifetimes.
 
 namespace pico_http {
 
@@ -41,19 +36,16 @@ namespace {
 constexpr std::size_t MAX_RECVED_CHUNK = 0xFFFF;
 }  // namespace
 
-// Bind the host-safe mirrors in the config module to the real lwipopts values,
-// so a change to TCP_MSS/TCP_WND that is not reflected in the shared constants
-// (which the HTTP service sizes its RX buffer from) fails the build here rather
-// than silently under-sizing the assembly buffer (AR-6).
+// Bind host-safe sizes to lwIP so the assembly window cannot be undersized
+// (AR-6).
 static_assert(TCP_MSS_BYTES == static_cast<std::size_t>(TCP_MSS),
               "TCP_MSS_BYTES must match lwipopts TCP_MSS");
 static_assert(ADVERTISED_RX_WINDOW == static_cast<std::size_t>(TCP_WND),
               "ADVERTISED_RX_WINDOW must match lwipopts TCP_WND");
 static_assert(TX_RING_CAPACITY <= static_cast<std::size_t>(TCP_SND_BUF),
               "TX ring must fit within the lwIP send buffer (TCP_SND_BUF)");
-// consume() reopens the window with one uint16_t tcp_recved() call; a single
-// consume can cover at most one full RX assembly buffer (== the advertised
-// window), so the window must fit in that argument or reopening would clamp.
+// The window must fit one uint16_t tcp_recved() call; consume() covers at
+// most one full RX buffer.
 static_assert(ADVERTISED_RX_WINDOW <= MAX_RECVED_CHUNK,
               "advertised window must fit a single uint16_t tcp_recved()");
 
@@ -61,9 +53,7 @@ namespace {
 
 constexpr std::uint8_t POLL_INTERVAL_TICKS = 4;  // lwIP poll ticks (~2 s)
 
-// AR-3 lock-hold sampling. Plain globals (not atomics): every lwIP lock span
-// runs in the same serialized cyw43 async-context, so there is no concurrent
-// writer to race with.
+// All lock-hold samples are written on the serialised async context (AR-3).
 #ifndef NDEBUG
 constexpr std::uint32_t LOCK_HOLD_BUDGET_US = 500;  // spec AR-3 p99 target
 
@@ -73,8 +63,8 @@ struct LockHoldSampler {
     std::uint32_t max_us = 0;
 };
 
-// The sampler accumulates across every lock span, so it cannot be const; see
-// above for why no synchronisation is needed.
+// cppcoreguidelines-avoid-non-const-global-variables: the sample accumulates
+// only on the serialised async context.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 LockHoldSampler g_lock_hold{};
 
@@ -87,9 +77,8 @@ void record_lock_hold(std::uint32_t held_us) {
 }
 #endif
 
-// PR-2 receive-callback sampling, in every build type. A function-local static
-// rather than a namespace variable, so the state needs no suppression; like the
-// lock-hold sample, it is written only from the serialized async context.
+// Receive timing is recorded in every build type on the serialised async
+// context (PR-2).
 constexpr std::uint32_t RECEIVE_BUDGET_US = 1000;  // spec PR-2 internal share
 
 LwipTcpTransport::ReceiveStats& receive_sample() noexcept {
@@ -116,9 +105,7 @@ class LwipLock {
 #ifndef NDEBUG
     LwipLock() {
         cyw43_arch_lwip_begin();
-        // Not a member initializer: those run before the constructor body, and
-        // the hold time is measured from after the lock is acquired, not from
-        // before the (possibly blocking) acquisition.
+        // cppcoreguidelines-prefer-member-initializer: timing follows locking.
         // NOLINTNEXTLINE(cppcoreguidelines-prefer-member-initializer)
         start_us_ = time_us_32();
     }
@@ -145,11 +132,10 @@ class LwipLock {
 #endif
 };
 
-// Marks a tracking slot with the pcb whose callback is executing for the
-// callback's duration, so teardown can distinguish an in-callback self-abort
-// (which must return ERR_ABRT) from one issued outside any callback. Distinct
-// from TransportBase::CallbackScope, which defers disconnect delivery; every
-// lwIP callback opens both.
+// Records the PCB whose callback is executing, so teardown can tell a
+// self-abort, which must return ERR_ABRT, from an external abort.
+// It is separate from CallbackScope, which defers disconnect delivery.
+// recv_callback, sent_callback and poll_callback open both.
 class PcbScope {
    public:
     PcbScope(tcp_pcb*& active, tcp_pcb* pcb) : active_(active) {
@@ -194,16 +180,14 @@ void LwipTcpTransport::reset_receive_stats() noexcept {
     receive_sample() = ReceiveStats{};
 }
 
-// The completion lock's lifetime is the object's, not the server's: stop() on
-// the HTTP side closes the server and then takes this lock once per slot, and a
-// service destroyed after a failed listen() takes it having never listened.
+// The completion lock outlives close_server() and exists even if listen()
+// failed.
 LwipTcpTransport::LwipTcpTransport() {
     critical_section_init(&completion_lock_);
 }
 
-// Qualified so the call cannot be read as dispatching to an override: during
-// ~LwipTcpTransport the dynamic type is already LwipTcpTransport, so a derived
-// close_server() would never run here.
+// The qualified call names LwipTcpTransport::close_server().
+// It cannot dispatch to a derived close_server() during destruction.
 LwipTcpTransport::~LwipTcpTransport() {
     LwipTcpTransport::close_server();
     critical_section_deinit(&completion_lock_);
@@ -218,9 +202,7 @@ err_t LwipTcpTransport::consume_abort(tcp_pcb* pcb) noexcept {
         aborted_pcb_ = nullptr;
         return ERR_ABRT;  // lwIP contract: report the in-callback abort
     }
-    // A teardown that aborted a pcb outside any callback (e.g. a direct
-    // close_client) may have left aborted_pcb_ set; drop it so it cannot alias
-    // a future pcb reused at the same address and trigger a spurious ERR_ABRT.
+    // The abort latch is cleared before a later PCB can reuse the address.
     aborted_pcb_ = nullptr;
     return ERR_OK;
 }
@@ -245,19 +227,14 @@ bool LwipTcpTransport::listen(std::uint16_t port) {
     tcp_arg(server_pcb_, this);
     tcp_accept(server_pcb_, accept_callback);
 
-    // Start the periodic timeout scan on the cyw43 async context (the same
-    // lwIP-safe context every callback runs in), so TR-1..5 deadlines fire at
-    // ~100 ms granularity (TR-1..TR-5).
+    // Scan deadlines on the async context every 100 ms (TR-1..TR-5).
     timeout_worker_.do_work = timeout_worker_entry;
     timeout_worker_.user_data = this;
     async_context_add_at_time_worker_in_ms(
         cyw43_arch_async_context(), &timeout_worker_, TIMEOUT_SCAN_INTERVAL_MS);
 
-    // Deferred completions (AR-9). A "when pending" worker rather than a timed
-    // one: respond() rings it, so the completion is serviced on the next turn
-    // of the async context rather than after up to one scan interval. The
-    // critical section guarding the record is the constructor's, not this
-    // function's.
+    // Pending work runs on the next async-context turn without waiting for
+    // the timed scan (AR-9).
     completion_worker_.do_work = completion_worker_entry;
     completion_worker_.user_data = this;
     async_context_add_when_pending_worker(cyw43_arch_async_context(),
@@ -382,10 +359,8 @@ void LwipTcpTransport::flush_tx(Slot& slot) {
     }
 }
 
-// The base has already disarmed the timeout and will release the slot and
-// deliver the disconnect once this returns. A caller that knows lwIP has
-// already freed the pcb (the error path) clears slot.pcb first, which skips
-// the teardown below.
+// The base disarms before this call and releases the slot afterwards. The
+// error path has already cleared a freed PCB.
 void LwipTcpTransport::release_slot_resources(ConnectionId /*client*/,
                                               Slot& slot,
                                               DisconnectReason /*reason*/) {
@@ -397,24 +372,13 @@ void LwipTcpTransport::release_slot_resources(ConnectionId /*client*/,
         tcp_sent(pcb, nullptr);
         tcp_poll(pcb, nullptr, 0);
         tcp_err(pcb, nullptr);
-        // The TxRing was handed to lwIP NOCOPY (tcp_write with flags=0), so
-        // lwIP may still hold pointers into slot.tx for unsent/unacked
-        // segments. A graceful tcp_close() leaves the pcb alive retransmitting
-        // from that memory — but we are about to clear the ring and hand the
-        // slot to the next connection, whose writes would overwrite bytes lwIP
-        // still references (wire corruption / use-after-reuse). So whenever
-        // data is still pending we tcp_abort() (RST) to drop the pcb and its
-        // queued segments immediately. The orderly drain-then-close path
-        // (close_client -> finish_close_if_drained) only reaches teardown once
-        // the ring is empty, so it still closes gracefully.
+        // lwIP can retain NOCOPY pointers into the ring. Abort before
+        // clearing pending data; an empty ring can close gracefully.
         const bool tx_pending = !slot.tx.empty();
         if (tx_pending || tcp_close(pcb) != ERR_OK) {
             tcp_abort(pcb);
-            // Only latch the abort when we are inside this pcb's own callback:
-            // that callback must return ERR_ABRT (via consume_abort()). An
-            // abort from the timeout worker or a direct close has no pending
-            // callback to consume it, and latching it could alias a pcb later
-            // reused at the same address.
+            // Only a callback aborting its own PCB must return ERR_ABRT.
+            // External aborts leave no pointer that could alias a later PCB.
             if (pcb == callback_pcb_) {
                 aborted_pcb_ = pcb;
             }
@@ -439,9 +403,8 @@ err_t LwipTcpTransport::accept_callback(void* arg, tcp_pcb* new_pcb,
     }
     Slot* slot = self->clients_.get(id);
     if (slot == nullptr) {
-        // Unreachable: acquire() just returned this id. Stated rather than
-        // assumed so the compiler can see it — without it the whole slot setup
-        // below reads as a potential null dereference.
+        // acquire() just issued this id, so failure to resolve it violates
+        // the slot invariant.
         self->clients_.release(id);
         tcp_abort(new_pcb);
         return ERR_ABRT;
@@ -467,11 +430,8 @@ err_t LwipTcpTransport::recv_callback(void* arg, tcp_pcb* pcb, pbuf* head,
                                       err_t err) {
     auto* slot = static_cast<Slot*>(arg);
     if (slot == nullptr) {
-        // release_slot_resources() unregisters every callback before it nulls
-        // tcp_arg, so a callback arriving without a slot is unreachable. The
-        // guard is here because error_callback has always had one, and this is
-        // the file with no host-test coverage — an inconsistency here is the
-        // one that survives.
+        // Teardown unregisters callbacks before clearing tcp_arg; a null slot
+        // is a defensive guard.
         if (head != nullptr) {
             pbuf_free(head);
         }
@@ -494,10 +454,8 @@ err_t LwipTcpTransport::recv_callback(void* arg, tcp_pcb* pcb, pbuf* head,
     self->timing_receive_ = true;
     self->receive_sent_ = false;
     for (pbuf* chunk = head; chunk != nullptr; chunk = chunk->next) {
-        // A segment can close or abort this connection. The slot is released at
-        // once (only the notification is deferred), so stop as soon as the id
-        // stops resolving rather than delivering the rest of the chain into a
-        // connection that is already gone.
+        // A segment can tear down the connection. Stop delivering as soon as
+        // its id stops resolving.
         if (!self->is_open(id)) {
             break;
         }
@@ -505,7 +463,7 @@ err_t LwipTcpTransport::recv_callback(void* arg, tcp_pcb* pcb, pbuf* head,
             static_cast<const std::uint8_t*>(chunk->payload), chunk->len);
         self->notify_receive(id, seg);
     }
-    // PR-2: processing ends at the first send, the total with the callback.
+    // Processing ends at first send; total ends at callback return (PR-2).
     const std::uint32_t end_us = time_us_32();
     self->timing_receive_ = false;
     record_receive(
@@ -538,9 +496,8 @@ err_t LwipTcpTransport::sent_callback(void* arg, tcp_pcb* pcb,
 }
 
 err_t LwipTcpTransport::poll_callback(void* arg, tcp_pcb* pcb) {
-    // Liveness backstop only: keep the transmit side moving and
-    // finish a drained close. All TR-1..5 deadlines are enforced by the
-    // periodic timeout worker via the scheduler, not here.
+    // Polling advances TX and drained close. The periodic worker enforces
+    // deadlines (TR-1..5).
     auto* slot = static_cast<Slot*>(arg);
     if (slot == nullptr) {
         return ERR_OK;  // no slot: see the note in recv_callback

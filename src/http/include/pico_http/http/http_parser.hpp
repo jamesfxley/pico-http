@@ -14,14 +14,8 @@
 #include "pico_util/containers/fixed_string.hpp"
 
 /// \file http_parser.hpp
-/// Incremental, single-pass HTTP/1.x request parser (BR-1..BR-5 boundaries,
-/// and the RFC conformance requirements). Fed
-/// arbitrarily segmented byte spans, it consumes each byte exactly once (no
-/// O(n^2) rescan-from-start), enforces the boundary limits from HttpLimits, and
-/// stops at a complete request or the first violation. Pure C++, no lwIP, no
-/// heap: request line, headers, and a bounded body live in fixed storage owned
-/// by the parser. Chunked Transfer-Encoding is decoded into the body buffer;
-/// any other (unsupported) coding is rejected with 501 (BR-9).
+/// Single-pass, fixed-storage HTTP request parsing across arbitrary byte
+/// splits (BR-1..BR-5, BR-9).
 
 namespace pico_http {
 
@@ -43,37 +37,25 @@ enum class ParseResult : std::uint16_t {
 /// is an error verdict carrying that status.
 constexpr std::uint16_t FIRST_ERROR_STATUS = 400U;
 
-/// Whether a ParseResult is a failure verdict rather than a state. True for
-/// every value at or above FIRST_ERROR_STATUS, whose numeric value is the HTTP
-/// status the service must send.
+/// True for an error whose numeric value is the HTTP status the service must
+/// send.
 constexpr bool is_error(ParseResult result) noexcept {
     return static_cast<std::uint16_t>(result) >= FIRST_ERROR_STATUS;
 }
 
-/// Incremental HTTP/1.1 request parser over a caller-supplied byte stream.
-///
-/// Feed it whatever arrives, in whatever sizes it arrives: it holds its own
-/// state between calls and never needs a whole request at once. Every capacity
-/// is fixed by `Limits` and nothing is allocated (AR-1), so exceeding one is a
-/// verdict — a ParseResult carrying the status to send — and never a truncated
-/// field. `feed()` stops at a request boundary and reports how much it took,
-/// leaving the rest for the next request, which is how pipelining works.
-///
-/// One parser handles one request at a time; call reset() before the next.
+/// Parses one request without allocation or truncation (AR-1). feed() leaves
+/// subsequent requests unconsumed. Call reset() before the next request.
 template <typename Limits = DefaultHttpLimits>
 class HttpParser {
-    // The header-count limit is enforced by HTTPHeaders' fixed storage, so the
-    // policy's advertised MAX_HEADERS (reported via /limits) must match it —
-    // otherwise the server would advertise a cap it does not actually enforce.
+    // The advertised header-count limit must match the capacity HTTPHeaders
+    // enforces.
     static_assert(Limits::MAX_HEADERS == HTTPHeaders::MAX_HEADERS,
                   "Limits::MAX_HEADERS must equal HTTPHeaders::MAX_HEADERS");
 
    public:
-    /// Feed a byte span. Returns the parser state after consuming as much as
-    /// possible; `consumed` is set to the number of bytes taken from `data`
-    /// (bytes past a Complete/error boundary are left for the caller — this is
-    /// how request pipelining is handled). Call reset() before the next
-    /// request.
+    /// Parse up to a request or error boundary and report bytes taken in
+    /// consumed.
+    /// Call reset() before parsing the next request.
     ParseResult feed(std::span<const std::uint8_t> data,
                      std::size_t& consumed) {
         consumed = 0;
@@ -104,9 +86,7 @@ class HttpParser {
         return result_;
     }
 
-    /// Return to the pre-request state, ready for the next request on the same
-    /// connection. Every accessor below reverts to its empty value; the
-    /// `Limits` the parser was instantiated with are unaffected.
+    /// Clear request state and accessor values without changing Limits.
     void reset() noexcept {
         state_ = State::METHOD;
         result_ = ParseResult::INCOMPLETE;
@@ -161,16 +141,14 @@ class HttpParser {
         return headers_;
     }
 
-    /// Buffered request body. Empty for a request that has none, and for one
-    /// whose body was streamed past the parser rather than buffered. Same
-    /// lifetime as method().
+    /// Buffered request body, empty when there is none.
+    /// The lifetime is the same as method().
     [[nodiscard]] std::span<const std::uint8_t> body() const noexcept {
         return std::span<const std::uint8_t>(body_.data(), body_len_);
     }
 
-    /// Value of the Content-Length header, or 0 when absent. This is what the
-    /// request declared, not what has arrived — compare against body().size()
-    /// to tell a complete body from a partial one.
+    /// Declared Content-Length, or zero when absent. body().size() reports
+    /// bytes received.
     [[nodiscard]] std::uint64_t content_length() const noexcept {
         return content_length_;
     }
@@ -181,18 +159,10 @@ class HttpParser {
         return expect_continue_;
     }
 
-    /// True once the request head (request line + headers) has been fully
-    /// parsed and the parser has moved on to the body. Lets the service tell a
-    /// header-completion timeout (TR-1) from a body-progress timeout (TR-2).
+    /// True after the head is parsed and the body phase begins (TR-1, TR-2).
     [[nodiscard]] bool reading_body() const noexcept { return head_complete_; }
 
-    /// True once any byte of the current request has been consumed (and it is
-    /// not yet complete): the connection is mid-request, not idle. Lets the
-    /// service keep a header/body deadline armed rather than falling back to
-    /// the idle deadline while a partial request sits in the parser. Derived
-    /// from the state machine: while INCOMPLETE, any progress out of the
-    /// initial METHOD state, an accumulated method token, or a consumed
-    /// leading CRLF (crlf_skipped_) means bytes were taken.
+    /// True after any byte is consumed while the request remains incomplete.
     [[nodiscard]] bool in_progress() const noexcept {
         return result_ == ParseResult::INCOMPLETE &&
                (state_ != State::METHOD || scratch_len_ > 0 || crlf_skipped_);
@@ -240,13 +210,8 @@ class HttpParser {
                                                    : Limits::MAX_HEADER_LINE) +
         2U;
 
-    // Every token accumulated in scratch_ is bounded by its own limit before
-    // push_scratch() is called, so scratch must cover the largest of them.
-    // MAX_URI and MAX_HEADER_LINE are covered by construction above; the method
-    // and version tokens are not, and a downstream Limits policy (limits.hpp
-    // exists to be replaced) that raised either past the scratch would silently
-    // truncate the token — routing a request to the wrong handler rather than
-    // rejecting it. Bind the two so that cannot compile.
+    // scratch_ must cover every token limit, including method and version
+    // overrides.
     static_assert(Limits::MAX_METHOD <= SCRATCH_CAPACITY,
                   "Limits::MAX_METHOD must fit the parser scratch buffer");
     static_assert(Limits::MAX_VERSION <= SCRATCH_CAPACITY,
@@ -258,10 +223,8 @@ class HttpParser {
     static constexpr std::uint8_t CHARGE_HEAD = 1U;
     static constexpr std::uint8_t CHARGE_REQUEST_LINE = 2U | CHARGE_HEAD;
 
-    /// The charge class of every state, in one place. Deliberately switches
-    /// over State with no default: adding a state without deciding which
-    /// budgets it is charged against is a compile error (-Wswitch), not a
-    /// silently uncharged byte.
+    /// Classifies each state for byte-budget accounting. A new unclassified
+    /// state fails -Wswitch.
     static constexpr std::uint8_t charge_class(State state) noexcept {
         switch (state) {
             case State::METHOD:
@@ -295,9 +258,8 @@ class HttpParser {
     }
 
     static constexpr int hex_value(std::uint8_t ch) noexcept {
-        // No cast on the subtractions: integer promotion has already made each
-        // one an int, so naming the type again is a no-op that
-        // -Wuseless-cast rejects.
+        // No cast: integer promotion already makes each subtraction int, and
+        // -Wuseless-cast rejects a redundant one.
         if (ch >= '0' && ch <= '9') {
             return ch - '0';
         }
@@ -310,12 +272,8 @@ class HttpParser {
         return -1;
     }
 
-    /// True iff the entire Transfer-Encoding value is a single "chunked" coding
-    /// — the only framing we can decode. Any additional coding (e.g.
-    /// "gzip, chunked" or "chunked, gzip") is unsupported and must be rejected
-    /// with 501 (BR-9), never decoded as if the extra coding were absent. A
-    /// comma anywhere means more than one coding is present, so it cannot be
-    /// chunked-only.
+    /// True only for a lone chunked coding. Additional codings must be
+    /// rejected with 501 (BR-9).
     static constexpr bool te_is_chunked_only(std::string_view value) noexcept {
         if (value.find(',') != std::string_view::npos) {
             return false;
@@ -354,9 +312,8 @@ class HttpParser {
         return ch > SP && ch < DEL;  // visible ASCII, no space/CTL/DEL
     }
 
-    // A control octet that must not appear in a header field line. HTAB is
-    // exempt (valid OWS and field-content); CR is handled separately as the
-    // line terminator. Rejects C0 controls, a bare LF, and DEL (RFC 9110 §5.5).
+    // C0 controls, bare LF and DEL must not appear in field lines. HTAB is
+    // allowed; CR is handled as the terminator (RFC 9110 §5.5).
     static constexpr bool is_field_ctl(std::uint8_t ch) noexcept {
         return (ch < SP && ch != HT) || ch == DEL;
     }
@@ -380,13 +337,8 @@ class HttpParser {
         state_ = State::DONE;
     }
 
-    // Every caller bounds the token against its own limit before pushing, and
-    // the static_asserts above prove each of those limits fits the scratch, so
-    // the guard below is unreachable in a well-formed build. It stays as the
-    // backstop for a limits policy that stops matching the buffer, and it
-    // rejects rather than truncating (CXX-07.2) — this used to return a bool
-    // that all three call sites discarded, which read as a check but performed
-    // none.
+    // Callers bound tokens by limits checked against scratch_. This guard
+    // rejects an unexpected excess without truncation.
     void push_scratch(std::uint8_t byte) noexcept {
         if (scratch_len_ >= SCRATCH_CAPACITY) {
             fail(ParseResult::BAD_REQUEST);
@@ -399,14 +351,8 @@ class HttpParser {
         return std::string_view(scratch_.data(), scratch_len_);
     }
 
-    // One `switch (state_)` over the whole request grammar. Splitting it per
-    // state group would spread the transition table — which state each byte
-    // moves to, and which boundary limit each arm charges — across functions
-    // that only ever run in this order, making the machine harder to verify
-    // against the spec rather than easier.
-    // The complexity is the HTTP/1.1 grammar's, and splitting the switch
-    // across functions would scatter the state transitions the spec is read
-    // against, as the comment above says.
+    // readability-function-size, readability-function-cognitive-complexity:
+    // one switch keeps grammar transitions and byte-budget charges together.
     // NOLINTNEXTLINE(readability-function-size,readability-function-cognitive-complexity)
     void step(std::uint8_t byte, std::span<const std::uint8_t> data,
               std::size_t& consumed) {
@@ -420,9 +366,8 @@ class HttpParser {
                         state_ = State::URI;
                     }
                 } else if (byte == CR && scratch_len_ == 0 && !crlf_skipped_) {
-                    // Ignore one empty line before the request-line
-                    // (RFC 9112 §2.2): clients commonly emit a stray CRLF
-                    // after a request body. Exactly one — a second is 400.
+                    // Accept exactly one leading empty line (RFC 9112 §2.2).
+                    // A second returns 400.
                     state_ = State::START_LF;
                 } else if (!is_tchar(byte) ||
                            scratch_len_ >= Limits::MAX_METHOD) {
@@ -448,9 +393,8 @@ class HttpParser {
                     if (scratch_len_ == 0) {
                         fail(ParseResult::BAD_REQUEST);
                     } else {
-                        // Bounded by the MAX_URI arm above, which fails with
-                        // URI_TOO_LONG before scratch can exceed uri_'s
-                        // capacity; the assign cannot truncate.
+                        // The MAX_URI check bounds scratch before assignment
+                        // to uri_.
                         static_cast<void>(uri_.assign(scratch_view()));
                         scratch_len_ = 0;
                         state_ = State::VERSION;
@@ -560,12 +504,9 @@ class HttpParser {
             case State::CHUNK_SIZE: {
                 const int digit = hex_value(byte);
                 if (digit >= 0) {
-                    // Reject an overflowing chunk size rather than let it wrap
-                    // (a wrap to 0 would be misread as the last chunk, letting
-                    // the real payload be reparsed as a new request — a
-                    // request-smuggling shape). Mirrors the Content-Length
-                    // overflow guard. chunk_remaining_ doubles as the size
-                    // accumulator here and the countdown once data starts.
+                    // Overflow could imitate the last chunk and expose
+                    // payload as a new request. chunk_remaining_ later counts
+                    // down the payload.
                     if (chunk_remaining_ >
                         (UINT64_MAX - static_cast<std::uint64_t>(digit)) /
                             HEX_BASE) {
@@ -576,16 +517,13 @@ class HttpParser {
                         chunk_size_has_digit_ = true;
                         count_overhead();
                     }
-                    // The missing-digit and the not-a-chunk-size branches both
-                    // reject, but for different RFC reasons that are stated
-                    // separately; merging them would erase the distinction.
+                    // bugprone-branch-clone: missing digits and invalid
+                    // syntax are separate RFC violations.
                     // NOLINTNEXTLINE(bugprone-branch-clone)
                 } else if (!chunk_size_has_digit_) {
-                    // RFC 9112 requires 1*HEXDIG: a bare ";ext" or CRLF where a
-                    // size belongs must not be misread as the last chunk (an
-                    // early terminator would let the remaining chunk data be
-                    // reparsed as the next request — a request-smuggling
-                    // shape).
+                    // A size must not omit its digits and imitate the last
+                    // chunk (RFC 9112 §7.1). Remaining payload could
+                    // otherwise become a new request.
                     fail(ParseResult::BAD_REQUEST);
                 } else if (byte == ';') {
                     state_ = State::CHUNK_EXT;
@@ -602,9 +540,8 @@ class HttpParser {
                 if (byte == CR) {
                     state_ = State::CHUNK_SIZE_LF;
                 } else if (is_field_ctl(byte)) {
-                    // Extensions are skipped, not parsed, but a control octet
-                    // (e.g. a bare LF) must still be rejected — it could hide
-                    // framing from an intermediary that parses more laxly.
+                    // A control octet must still be rejected in skipped
+                    // extensions to prevent disagreement over framing.
                     fail(ParseResult::BAD_REQUEST);
                 } else {
                     count_overhead();
@@ -624,10 +561,8 @@ class HttpParser {
                 break;
 
             case State::CHUNK_DATA: {
-                // Bulk-copy the chunk-data run rather than dispatch per byte
-                // (as the identity BODY state does). `want` is clamped in
-                // 64-bit first so a huge chunk_remaining_ cannot truncate on a
-                // 32-bit size_t before the min with the available bytes.
+                // Clamp in 64 bits before narrowing to size_t, so a large
+                // chunk cannot wrap on a 32-bit host.
                 const std::size_t avail = data.size() - consumed;
                 auto want = static_cast<std::size_t>(
                     std::min<std::uint64_t>(avail, chunk_remaining_));
@@ -730,10 +665,8 @@ class HttpParser {
                is_digit(version[PREFIX.size() + 2]);
     }
 
-    // Classify the request-line version token. A supported version yields
-    // COMPLETE; a well-formed but unsupported one (e.g. HTTP/2.0, HTTP/1.9)
-    // yields 505 (RFC 9110 §15.6.6); anything not matching HTTP-version syntax
-    // is a malformed request line -> 400.
+    // Unsupported valid versions return 505; malformed version tokens return
+    // 400 (RFC 9110 §15.6.6).
     static ParseResult classify_version(std::string_view version) noexcept {
         if (version == "HTTP/1.0" || version == "HTTP/1.1") {
             return ParseResult::COMPLETE;
@@ -759,17 +692,12 @@ class HttpParser {
         if (detail::iequals(name, "Content-Length")) {
             ingest_content_length(value);
         } else if (detail::iequals(name, "Transfer-Encoding")) {
-            // A second Transfer-Encoding header means more than one coding is
-            // stacked across lines (e.g. "gzip" then "chunked"); we can only
-            // frame a lone "chunked", so anything else stays unsupported (501
-            // via begin_body).
+            // A second Transfer-Encoding field exceeds the supported lone
+            // chunked coding and yields 501.
             te_chunked_ = !te_present_ && te_is_chunked_only(value);
             te_present_ = true;
         } else if (detail::iequals(name, "Expect")) {
-            // The only expectation this server implements is 100-continue; any
-            // other member is an expectation it cannot meet, and silently
-            // ignoring it would be lying to the client (RFC 9110 §10.1.1 ->
-            // 417).
+            // An unsupported expectation receives 417 (RFC 9110 §10.1.1).
             if (detail::iequals(value, "100-continue")) {
                 expect_continue_ = true;
             } else {
@@ -785,11 +713,9 @@ class HttpParser {
             return;
         }
 
-        // add() combines a repeated field name into a comma-separated list
-        // (RFC 9110 §5.2) rather than letting the last occurrence silently
-        // replace the earlier ones — replacement would let e.g. a second
-        // "Connection: keep-alive" line erase an earlier "close". Overflow of
-        // count or combined length is 431, never a silent drop (BR-7).
+        // Combine repeated fields so a later line cannot erase an earlier one.
+        // Connection: close is one example. Overflow returns 431
+        // (BR-7; RFC 9110 §5.2).
         if (!headers_.add(name, value)) {
             fail(ParseResult::HEADER_FIELDS_TOO_LARGE);
         }
@@ -822,25 +748,22 @@ class HttpParser {
     }
 
     void begin_body() {
-        // NR-5: RFC 9110 10.1.1 and 15.2 forbid 1xx for HTTP/1.0.
+        // HTTP/1.0 receives no 1xx response (NR-5; RFC 9110 §10.1.1, §15.2).
         if (version_.view() == "HTTP/1.0") {
             expect_continue_ = false;
         }
         head_complete_ = true;  // request line + headers fully parsed
-        // RFC 9112 §3.2: an HTTP/1.1 request MUST carry exactly one Host
-        // header; a missing or duplicated Host is malformed. HTTP/1.0 has no
-        // such rule.
+        // An HTTP/1.1 request MUST carry exactly one Host header. HTTP/1.0
+        // has no such rule (RFC 9112 §3.2).
         if (version_.view() == "HTTP/1.1" && host_count_ != 1U) {
             fail(ParseResult::BAD_REQUEST);
             return;
         }
-        // The 1.0-with-TE and the CL+TE branches both reject, but they are
-        // distinct framing faults with distinct RFC citations; merging them
-        // would erase the distinction.
+        // bugprone-branch-clone: HTTP/1.0 Transfer-Encoding and CL+TE are
+        // separate RFC framing faults.
         // NOLINTNEXTLINE(bugprone-branch-clone)
         if (te_present_ && version_.view() != "HTTP/1.1") {
-            // Transfer-Encoding did not exist in HTTP/1.0: a 1.0 message
-            // carrying it has faulty framing and must be rejected, not decoded
+            // HTTP/1.0 Transfer-Encoding must be rejected as faulty framing
             // (RFC 9112 §6.1).
             fail(ParseResult::BAD_REQUEST);
         } else if (te_present_ && cl_present_) {
@@ -873,9 +796,8 @@ class HttpParser {
 
     State state_ = State::METHOD;
     ParseResult result_ = ParseResult::INCOMPLETE;
-    // One empty line before the request-line has been consumed (RFC 9112
-    // §2.2); a second is rejected. Also marks the connection as mid-request
-    // for in_progress().
+    // Set once one leading empty line is consumed (RFC 9112 §2.2); a second is
+    // rejected. in_progress() counts it as progress.
     bool crlf_skipped_ = false;
 
     std::array<char, SCRATCH_CAPACITY> scratch_{};
@@ -897,9 +819,8 @@ class HttpParser {
     // Doubles as the chunk-size hex accumulator (in CHUNK_SIZE) and the
     // remaining-bytes countdown (in CHUNK_DATA); one field, one lifecycle.
     std::uint64_t chunk_remaining_ = 0;
-    // A chunk-size line needs 1*HEXDIG before ';' or CR (RFC 9112 §7.1): a
-    // zero-length size must not alias the "0" last-chunk. Cleared on entry to
-    // CHUNK_SIZE.
+    // A chunk size must not omit its digits and alias the last-chunk. Reset
+    // on entry to CHUNK_SIZE (RFC 9112 §7.1).
     bool chunk_size_has_digit_ = false;
     std::size_t overhead_bytes_ = 0;  // chunk framing / trailer bytes
     std::size_t host_count_ = 0;      // Host header occurrences (RFC 9112 §3.2)

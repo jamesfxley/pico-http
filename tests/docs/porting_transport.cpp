@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-// A custom transport's declaration, at namespace scope as a porter writes it.
-// Every override must match the base, which is what this compiles.
+// Every override must match the transport base.
 #include <cstddef>
 #include <cstdint>
 #include <pico_http/pico_http.hpp>

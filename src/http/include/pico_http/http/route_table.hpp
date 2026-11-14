@@ -14,22 +14,14 @@
 
 namespace pico_http {
 
-/// Route lookup supporting exact and wildcard patterns.
-///
-/// Patterns ending in `*` match by prefix; anything else matches exactly.
-/// Method comparison is case-insensitive, and a `*` method matches any verb.
-/// Method and pattern are stored in fixed-capacity strings (15 / 127 chars); a
-/// registration that does not fit is rejected rather than stored truncated,
-/// because a truncated pattern would never match the route the caller asked
-/// for and would fail as a silent 404 at request time. Registration allocates
-/// (init budget, AR-1); lookup is a heap-free linear scan, which at the route
-/// counts an embedded server carries is well inside the PR-2 internal-latency
-/// budget. Registering the same method + pattern twice replaces the handler.
+/// Exact routes take precedence over trailing-* prefix routes. Method
+/// matching ignores case; * matches any method.
+/// Registration allocates and rejects excess method or pattern length. Lookup
+/// allocates nothing. Re-registration replaces the handler (AR-1, PR-2).
 class RouteTable {
    public:
-    /// Max stored method-token length; exposed to bound the 405 Allow buffer.
-    /// The usable length, as every other cap here is (BR-2): a method of
-    /// exactly this many characters registers whole.
+    /// Usable method-token capacity in characters, also bounding Allow
+    /// (BR-2).
     static constexpr size_t METHOD_CAPACITY = 16U;
 
    private:
@@ -89,16 +81,10 @@ class RouteTable {
         return nullptr;
     }
 
-    /// Collect the distinct methods registered for any route whose pattern
-    /// matches `uri`, into `out`, for a 405 Allow header (RFC 9110 §10.2.1).
-    /// Returns the count written (clamped to out.size()). A "*"-method route is
-    /// skipped: it matches every method, so find_route would already have
-    /// dispatched it.
-    ///
-    /// The views written into `out` alias this table's own storage — they are
-    /// not copies, and they do not own the characters they name. They stay
-    /// valid while the table does and while no route is added, and they dangle
-    /// if it is destroyed. `out` is the caller's, and the caller keeps it.
+    /// Collect distinct methods for matching URI patterns, bounded by
+    /// out.size(). Wildcard methods are skipped (RFC 9110 §10.2.1).
+    /// The views remain valid while the table lives and no route is added.
+    /// The caller owns out.
     [[nodiscard]] std::size_t allowed_methods(
         std::string_view uri, std::span<std::string_view> out) const {
         std::size_t count = 0;

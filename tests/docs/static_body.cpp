@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// The static body mode, given a response and a page in flash.
 #include <cstdint>
 #include <pico_http/pico_http.hpp>
 #include <span>

@@ -47,9 +47,8 @@ void FakeTcpTransport::set_on_refused(std::function<void()> cb) {
 bool FakeTcpTransport::listen(std::uint16_t port) {
     last_port_ = port;
     if (listen_result_) {
-        // A successful listen re-opens the door a previous close_server() shut,
-        // so a stop/restart cycle is testable. The real transport binds a fresh
-        // listening pcb here; nothing of the old one survives.
+        // A successful listen permits connections after close_server(),
+        // modelling a fresh listening PCB.
         server_closed_ = false;
     }
     return listen_result_;
@@ -88,23 +87,18 @@ void FakeTcpTransport::consume(ConnectionId client, std::size_t bytes) {
     if (sim == nullptr) {
         return;
     }
-    // Clamped, where LwipTcpTransport hands the value straight to tcp_recved.
-    // A service acknowledging more bytes than were delivered would be absorbed
-    // here and would over-advertise the receive window on device. Left as a
-    // clamp rather than counted: both call sites in HttpService pass a value
-    // the parser derived from bytes it was given -- data.size() on the closing
-    // path, the parser's own offset on the receive path -- and no input has
-    // been found that makes the total exceed the total delivered. Counting an
-    // unreachable case would assert a bound this double cannot currently reach.
+    // The fake clamps to delivered bytes; firmware passes credit to
+    // tcp_recved() unchecked, where over-acknowledgement would advertise window
+    // the buffer cannot hold.
     sim->rx_unacked -= std::min(bytes, sim->rx_unacked);
 }
 
 void FakeTcpTransport::advance_time(std::uint32_t ms) {
     now_ms_ += ms;
     if (server_closed_) {
-        // close_server() removes the timeout worker from the async context
-        // (LwipTcpTransport::close_server), so no sweep runs after it. The
-        // clock still advances: a test may close, wait, and listen again.
+        // LwipTcpTransport::close_server() removes its timeout worker, so no
+        // sweep runs. The clock still advances so a test can close, wait and
+        // listen again.
         return;
     }
     fire_expired_timeouts();
@@ -117,12 +111,8 @@ void FakeTcpTransport::set_idle_timeout(std::uint32_t seconds) {
 FakeTcpTransport::ConnectionId FakeTcpTransport::connect() {
     const CallbackScope scope(*this);
     if (server_closed_) {
-        // Not listening: the real transport has closed its listening pcb and
-        // cleared tcp_accept, so the peer gets a RST and no callback reaches
-        // the service. Deliberately *not* notify_refused() -- that models a
-        // slot-table refusal (RR-3), which the service does see. An id is
-        // returned invalid so a caller that ignores the distinction cannot
-        // drive a connection that the firmware would never have admitted.
+        // A closed listener produces no service callback. notify_refused()
+        // models only slot exhaustion (RR-3).
         return ConnectionId{};
     }
     ConnectionId id = clients_.acquire();
@@ -132,9 +122,8 @@ FakeTcpTransport::ConnectionId FakeTcpTransport::connect() {
     }
     detail::ClientSim* sim = clients_.get(id);
     if (sim == nullptr) {
-        // Unreachable: acquire() just returned this id, so it resolves. The
-        // generation check hides that from the optimiser, which flags the
-        // dereference at -O2 and above. Fail closed rather than suppress.
+        // acquire() just issued this id; the check keeps -O2 null-dereference
+        // diagnostics quiet without a suppression.
         clients_.release(id);
         return ConnectionId{};
     }
@@ -188,9 +177,8 @@ std::size_t FakeTcpTransport::deliver_segmented(
     const CallbackScope scope(*this);
     std::size_t total = 0;
     for (const std::string_view segment : segments) {
-        // Mirrors the lwIP recv callback walking a pbuf chain: one scope, one
-        // notify_receive per segment, and a stop as soon as a segment's handler
-        // has torn the connection down.
+        // One scope models a chained pbuf arrival, stopping at teardown
+        // between segments.
         detail::ClientSim* sim = clients_.get(client);
         if (sim == nullptr) {
             break;

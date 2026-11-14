@@ -63,8 +63,8 @@ constexpr auto ITEM_BODY = "/item/0000"sv;
 constexpr std::size_t ITEM_NUMBER_OFFSET = "GET /item/"sv.size();
 constexpr std::size_t PIPELINE_REQUESTS = (TCP_WND / ITEM_REQUEST.size()) + 8;
 constexpr std::size_t PIPELINE_SIZE = PIPELINE_REQUESTS * ITEM_REQUEST.size();
-// Includes status, framing, content type and keep-alive fields for each small
-// reply. An enlarged header must fit this test's explicit capture budget.
+// The capture budget includes status, framing, type and persistence fields.
+// Enlarged headers must fit it.
 constexpr std::size_t SMALL_RESPONSE_BUDGET = 256;
 constexpr std::size_t CAPTURE_SIZE =
     std::max(BODY_SIZE + 512, (PIPELINE_REQUESTS + 1) * SMALL_RESPONSE_BUDGET);
@@ -199,8 +199,8 @@ void abort_peer(Peer& peer) {
     }
 }
 
-// Poll loopback outside any TCP callback; the background architecture remains
-// NO_SYS and does not service netif's loopback queue itself (AR-5, AR-6).
+// NO_SYS queues loopback packets for application polling outside TCP
+// callbacks to avoid re-entry (AR-5, AR-6).
 void poll_loopback() {
     const LwipLock lock;
     netif_poll_all();
@@ -317,7 +317,6 @@ bool take_response(std::string_view& remaining, std::string_view body) {
     return true;
 }
 
-// Check every byte and response boundary, including absence of a second reply.
 bool small_responses(Peer& peer, std::size_t count,
                      std::string_view body = "ok") {
     if (peer.error != ERR_OK || peer.overflow) {
@@ -360,7 +359,7 @@ void clear_peers() {
         wait_for([] { return state().server->active_connections() == 0; }));
 }
 
-// AR-5: hold actual TCP receive credit, fill the server's ring, then resume.
+// Held TCP receive credit forces ring backpressure before resumption (AR-5).
 bool ack_resumes() {
     auto& peer = state().peers.front();
     if (!open_peer(peer, true) || !await_connection(peer)) {
@@ -410,8 +409,8 @@ bool ack_resumes() {
     return true;
 }
 
-// AR-6: a pending first request stops parser consumption of the pipeline.
-// The known pipeline exceeds TCP_WND; every subsequent response must survive.
+// The pipeline exceeds TCP_WND. Every response must survive the pending first
+// request (AR-6).
 bool window_reopens() {
     auto& peer = state().peers.front();
     {
@@ -424,8 +423,8 @@ bool window_reopens() {
         !wait_for([] { return state().pending; })) {
         return false;
     }
-    // Queue at least one window without trying to synchronously queue the
-    // whole pipeline: that would deadlock behind the intentionally held window.
+    // Synchronously queuing the whole pipeline would deadlock behind the held
+    // window.
     std::size_t sent = 0;
     if (!wait_for([&] {
             if (peer.pcb == nullptr) {
@@ -456,7 +455,7 @@ bool window_reopens() {
            state().server->statistics().rx_overflow_drops == 0;
 }
 
-// RR-3: every original connection must still serve after the actual RST.
+// Every original connection must still serve after the RST (RR-3).
 bool refuses_extra() {
     {
         const LwipLock lock;
@@ -505,8 +504,8 @@ bool timer_complete(repeating_timer_t* /*timer*/) {
     return true;
 }
 
-// Keep the bracket visible in the linked disassembly (AR-9). It encloses only
-// the actual competing call, never the network wait for a parked request.
+// noinline keeps the bracket visible in the linked disassembly. It encloses
+// only the competing call, not the network wait for the parked request (AR-9).
 [[gnu::noinline]] bool mainline_complete(State& shared) {
     shared.in_progress.store(true, std::memory_order_release);
     const bool won = shared.server->respond(shared.parked, fill_a, nullptr);
@@ -514,9 +513,9 @@ bool timer_complete(repeating_timer_t* /*timer*/) {
     return won;
 }
 
-// Close eligibility before waiting. Mask IRQs while retiring the arm so the
-// exclusive-store retry loop cannot add observable instructions after the
-// bracket. Only the timer that claims its exchange may publish filler B.
+// Eligibility closes before waiting. Masking IRQs keeps exclusive-store
+// retries from extending the observed bracket. Only the timer claiming the
+// exchange may publish filler B.
 [[gnu::noinline]] bool race_publishers(State& shared, bool& main_won) {
     shared.armed.store(true, std::memory_order_release);
     main_won = mainline_complete(shared);
@@ -561,11 +560,11 @@ bool contend_once(Peer& peer, bool& landed) {
     });
 }
 
-// AR-9: reject an unanswered request after teardown and after slot reuse.
+// An unanswered request becomes stale after teardown and reuse (AR-9).
 bool stale_after_teardown(Peer& peer) {
     auto& shared = state();
-    // AR-9: this new request has never had a completion published. Its id
-    // must become inert because of teardown, independently of duplicate guards.
+    // The id must become inert on teardown without relying on duplicate
+    // guards (AR-9).
     {
         const LwipLock lock;
         peer.received = 0;
@@ -633,7 +632,7 @@ bool stale_after_teardown(Peer& peer) {
     return shared.fills == 0 && small_responses(peer, 1);
 }
 
-// AR-9: duplicate publishers race, but only the async context fills/sends.
+// Duplicate publishers race. The async context alone fills and sends (AR-9).
 bool deferred_contention() {
     auto& shared = state();
     auto& peer = shared.peers.front();

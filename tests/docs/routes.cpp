@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Routes and handlers, given the server and a handler to register.
 #include <pico_http/pico_http.hpp>
 
 namespace doc_examples {

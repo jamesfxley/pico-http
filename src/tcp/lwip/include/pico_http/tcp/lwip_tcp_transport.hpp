@@ -14,24 +14,19 @@
 #include "pico_http/tcp/transport_base.hpp"
 #include "pico_http/util/tx_ring.hpp"
 
-// Forward declarations of lwIP types; both names are lwIP's, not ours, so the
-// case style is fixed by the library this header declares against.
+// readability-identifier-naming: the forward-declared type names belong to
+// lwIP.
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct tcp_pcb;
-// lwIP's name, as above.
+// readability-identifier-naming: pbuf is an lwIP type.
 // NOLINTNEXTLINE(readability-identifier-naming)
 struct pbuf;
 
 /// \file lwip_tcp_transport.hpp
-/// Firmware transport implementing ITcpTransport over the lwIP raw API (spec
-/// AR-1). Slot handling, timeouts, the drain-close lifecycle and deferred
-/// disconnect delivery come from TransportBase; what is specific here is the
-/// lwIP binding. The load-bearing detail is that the lwIP callback arg is the
-/// per-connection Slot (not the server), so the error path — where lwIP has
-/// already freed the pcb — reaches connection state in O(1). Outbound data is
-/// staged in a per-slot zero-copy TxRing and handed to tcp_write() without
-/// TCP_WRITE_FLAG_COPY (AR-2/AR-5); inbound bytes are acknowledged to lwIP only
-/// when the application consume()s them (AR-6).
+/// Firmware raw-TCP adapter with fixed slots (AR-1).
+/// Each callback argument names its slot, including tcp_err after the PCB is
+/// freed. Sends retain ring bytes until ACK; consume() returns receive credit
+/// (AR-2, AR-5, AR-6).
 
 namespace pico_http {
 
@@ -57,11 +52,7 @@ struct LwipSlot {
 
 }  // namespace detail
 
-/// The lwIP-backed TCP transport: the one component touching the lwIP raw API
-/// and the cyw43 async context.
-///
-/// Firmware only. A host build takes pico_http::testing's fake instead, which
-/// stands in for this at the same seam.
+/// Firmware transport over raw lwIP and the cyw43 async context.
 class LwipTcpTransport
     : public tcp::TransportBase<detail::LwipSlot,
                                 ::pico_http::MAX_CONNECTIONS> {
@@ -69,13 +60,8 @@ class LwipTcpTransport
     /// Per-connection state this transport keeps.
     using Slot = detail::LwipSlot;
 
-    // AR-3 lock-discipline sampling. Every span the library holds the lwIP lock
-    // (cyw43_arch_lwip_begin/end) is timed in debug builds; the spec requires a
-    // p99 hold time <= 500 us under load (measured in t5). `within_500us /
-    // samples >= 0.99` establishes the p99 bound without storing a histogram.
-    // Zero-cost in release builds (NDEBUG): no sample is taken.
-    /// AR-3's lock-discipline sample. `within_500us / samples >= 0.99`
-    /// establishes the p99 bound without storing a histogram.
+    /// Debug lock-hold counts; within_500us / samples >= 0.99 establishes the
+    /// p99 bound (AR-3).
     struct LockHoldStats {
         /// Total lock spans timed.
         std::uint32_t samples;
@@ -85,25 +71,17 @@ class LwipTcpTransport
         std::uint32_t max_us;
     };
 
-    /// The lock-hold sample so far. All zero in a release build, which takes no
-    /// sample. Call from the async context (a route handler), which the lock
-    /// spans that write it also run in.
+    /// Lock-hold counts, all zero in Release. Read from the async context
+    /// that writes them.
     static LockHoldStats lock_hold_stats() noexcept;
     /// Discard the sample and start a fresh measurement window. Call from the
     /// async context, as lock_hold_stats().
     static void reset_lock_hold_stats() noexcept;
 
-    /// PR-2's internal-processing sample, taken in every build type because
-    /// PR-2 is measured on a release build. Each receive callback that delivers
-    /// data is one sample, timed two ways:
-    ///   - processing: from the callback's start to its first send(), which is
-    ///     the parsing, routing, handler and serialization of the response it
-    ///     starts; or the whole callback when it sends nothing;
-    ///   - total: the whole callback, the handoff of the response to lwIP and
-    ///     the radio included.
-    /// A request split across callbacks is several samples, and a deferred
-    /// handler (AR-9) runs outside any of them. `within_1ms / samples`
-    /// establishes a share without storing a histogram.
+    /// Receive-callback timing in every build type (PR-2).
+    /// Processing ends at the first send or callback return. Total includes
+    /// the full callback. Split requests contribute several samples; deferred
+    /// completion is outside them (AR-9).
     struct ReceiveStats {
         /// Receive callbacks timed.
         std::uint32_t samples;
@@ -134,22 +112,18 @@ class LwipTcpTransport
 
     bool listen(std::uint16_t port) override;
     void close_server() override;
-    /// Overridden only to take the lwIP stack lock: the drain-close logic
-    /// itself is TransportBase::close_client_impl(). arm_timeout/clear_timeout
-    /// need no override — they run only from inside lwIP callbacks, which are
-    /// already on the async context.
+    /// The override takes the stack lock before the shared drain-close path.
+    /// Timeout operations already run in the async context.
     void close_client(ConnectionId client) override;
     std::size_t send(ConnectionId client,
                      std::span<const std::uint8_t> data) override;
     [[nodiscard]] std::size_t send_credit(ConnectionId client) const override;
     void consume(ConnectionId client, std::size_t bytes) override;
-    // set_idle_timeout is intentionally not overridden: idle timing (TR-3) is
-    // armed by the HTTP layer through arm_timeout(), so the base no-op is
-    // correct here.
+    // The HTTP layer arms idle deadlines through arm_timeout(); the idle hint
+    // needs no override (TR-3).
 
-    /// AR-9 doorbell. Safe from core 1 and from an ISR: async_context.h
-    /// documents set_work_pending as callable "from any context including
-    /// IRQs", and nothing else here runs.
+    /// Signals the async worker from any context, including an ISR (AR-9;
+    /// async_context.h).
     void signal_completion() override;
     void lock_completions() override;
     void unlock_completions() override;
@@ -185,40 +159,24 @@ class LwipTcpTransport
                                         async_when_pending_worker_t* worker);
     static std::uint32_t now_ms();
 
-    // lwIP requires a callback that aborts its own pcb (tcp_abort) to return
-    // ERR_ABRT so lwIP stops touching the freed pcb. Teardown records an
-    // aborted pcb here — but only when it is the pcb of the callback currently
-    // executing (callback_pcb_), so an abort from the timeout worker or a
-    // direct close cannot leave a pointer that aliases a later pcb reused at
-    // the same address. The active callback consumes it via consume_abort().
+    // Only a self-abort inside the active PCB callback is latched so
+    // consume_abort() returns ERR_ABRT. An external abort leaves no pointer
+    // that could alias a reused PCB.
     err_t consume_abort(tcp_pcb* pcb) noexcept;
 
     async_at_time_worker_t timeout_worker_{};
-    // Deferred completions (AR-9). signal_completion() may run on core 1 or in
-    // an ISR, so it does the only two things safe there: set the worker pending
-    // (documented safe from any context) and return. The work itself runs in
-    // completion_worker_entry, on the async context, where lwIP calls are
-    // legal.
+    // signal_completion() can mark this worker pending from another core or
+    // ISR. The worker sends on the async context (AR-9).
     async_when_pending_worker_t completion_worker_{};
-    // Guards the HTTP layer's completion record, not any state here (AR-3).
-    // A spin lock plus IRQ disable: the writer may be an ISR on either core, so
-    // a mutex would be wrong twice over.
-    //
-    // Initialised by the constructor and released by the destructor, so it is
-    // valid for as long as an object exists to be asked for it. Tying it to
-    // listen()/close_server() instead would leave HttpService::stop() -- which
-    // closes the server and then takes this lock once per slot -- holding a
-    // spin lock already returned to the free pool, and would leave it null
-    // when listen() never ran.
+    // An IRQ-disabling spin lock guards HTTP completion records across both
+    // cores for the entire object lifetime (AR-3).
     critical_section_t completion_lock_{};
     tcp_pcb* server_pcb_ = nullptr;
     tcp_pcb* aborted_pcb_ = nullptr;
-    // The pcb whose lwIP callback is currently on the stack (nullptr outside
-    // any callback), so teardown can tell an in-callback self-abort — which
-    // must return ERR_ABRT — from an abort issued by the timeout worker or a
-    // direct close, which must not latch aborted_pcb_.
+    // The active callback PCB, or nullptr outside callbacks. Self-abort must
+    // return ERR_ABRT; external abort must not latch aborted_pcb_.
     tcp_pcb* callback_pcb_ = nullptr;
-    // PR-2: the receive callback being timed, and when it first sent.
+    // The timed receive callback and its first-send timestamp (PR-2).
     bool timing_receive_ = false;
     bool receive_sent_ = false;
     std::uint32_t first_send_us_ = 0;

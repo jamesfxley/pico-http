@@ -11,13 +11,15 @@ Warnings fail. Report unavailable checks as missing evidence, never as passes.
 
 Before work, read `infra/agents/AGENTS.md`; it routes to the family's and the platform's guides.
 
-Keep family facts here. Machine notes live in `local.md` in your House config
-directory; `python3 dev.py context` prints where that is. Extend the platform
-only through its declared configuration and `house.api`; do not edit pinned or
-synced files. Initialize recursive submodules before checks.
-Use pinned guide links, not installed copies. Document public installed module
-targets separately from internal exports. Commit subjects name the changed
-directory or dominant area; no trailers. The working agreements' approval
-boundaries apply.
+Keep this repository's purpose, done command and routing pointers in its
+AGENTS.md. Keep family-wide facts in family documentation. Machine notes live in
+`local.md` in your House config directory; `python3 dev.py context` prints where
+that is. Extend the platform only through its declared configuration and
+`house.api`; do not edit pinned or synced files. Initialise recursive submodules
+before checks. Use pinned guide links, not installed copies. Document public
+installed module targets separately from internal exports. Commit subjects and
+trailers follow EN-07.2 and EN-07.4 in
+`infra/house/standard/engineering/07-version-control.md`. The working agreements'
+approval boundaries apply.
 
 never create `CLAUDE.md` or `CLAUDE.local.md`

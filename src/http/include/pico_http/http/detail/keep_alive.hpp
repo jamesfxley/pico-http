@@ -7,9 +7,7 @@
 #include "pico_http/http/detail/parsing.hpp"
 
 /// \file keep_alive.hpp
-/// HTTP/1.0-vs-1.1 keep-alive negotiation (spec NR-2) used by HttpService, kept
-/// in one place so the policy lives in exactly one spot. Not part of the stable
-/// public API.
+/// Internal HTTP persistence negotiation (NR-2).
 
 namespace pico_http::detail {
 
@@ -17,15 +15,8 @@ inline constexpr std::string_view HTTP_VERSION_1_1 = "HTTP/1.1";
 inline constexpr std::string_view CONNECTION_CLOSE = "close";
 inline constexpr std::string_view CONNECTION_KEEP_ALIVE = "keep-alive";
 
-/// Decide whether a connection stays open after this request/response.
-///   - keep-alive disabled          -> always close
-///   - HTTP/1.1 (or unversioned)     -> keep-alive unless the request said
-///   close
-///   - HTTP/1.0                      -> close unless the request asked to keep
-///     alive (and did not also say close)
-///   - an explicit response Connection header overrides the version default
-///   - a per-connection request cap  -> close once it is reached, and it is
-///     applied last so a handler cannot override a resource bound
+/// Decide persistence from configuration, version and Connection headers. The
+/// request cap applies last.
 inline bool keep_alive_allowed(bool enabled,
                                std::string_view request_connection,
                                std::string_view request_version,
@@ -53,11 +44,8 @@ inline bool keep_alive_allowed(bool enabled,
         }
     }
 
-    // The per-connection request cap is applied last, after the response
-    // header has had its say. It is a resource bound rather than a preference —
-    // it limits how long one peer can hold a slot (CXX-12.7) — so a handler
-    // that sets Connection: keep-alive outranks the version default but must
-    // not be able to switch off a limit it may not know exists.
+    // A handler must not override the request cap, even if it might not know
+    // the cap exists.
     if (max_requests > 0U && requests_served >= max_requests) {
         allowed = false;
     }

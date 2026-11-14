@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// The README's host construction, over the fake transport.
 #include <memory>
 #include <pico_http/pico_http.hpp>
 #include <pico_http/testing/fake_tcp_transport.hpp>

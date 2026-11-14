@@ -5,8 +5,7 @@
 #include <string_view>
 
 /// \file parsing.hpp
-/// Low-level byte-scanning helpers shared by the HTTP request parser and its
-/// tests. Not part of the stable public API.
+/// Internal byte-scanning helpers for request parsing.
 
 namespace pico_http::detail {
 

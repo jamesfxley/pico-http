@@ -59,9 +59,9 @@ TEST(FakeTcpTransportTest, SendIsCreditBasedAndCapturesBytes) {
     const ConnectionId id = transport.connect();
 
     auto data = iota_bytes(12);
-    EXPECT_EQ(transport.send(id, bytes(data)), 8U);  // only 8 fit
+    EXPECT_EQ(transport.send(id, bytes(data)), 8U);
     EXPECT_EQ(transport.send_inflight(id), 8U);
-    EXPECT_EQ(transport.send(id, bytes(data)), 0U);  // full: no credit
+    EXPECT_EQ(transport.send(id, bytes(data)), 0U);
 
     auto captured = transport.sent_bytes(id);
     EXPECT_EQ(captured,
@@ -73,19 +73,19 @@ TEST(FakeTcpTransportTest, SendCreditReportsRingFreeSpace) {
     transport.set_send_capacity(8);
     const ConnectionId id = transport.connect();
 
-    EXPECT_EQ(transport.send_credit(id), 8U);  // empty ring: full capacity
+    EXPECT_EQ(transport.send_credit(id), 8U);
     transport.send(id, bytes(iota_bytes(5)));
-    EXPECT_EQ(transport.send_credit(id), 3U);  // 5 accepted, 3 free
+    EXPECT_EQ(transport.send_credit(id), 3U);
     transport.send(id, bytes(iota_bytes(3)));
-    EXPECT_EQ(transport.send_credit(id), 0U);  // full ring: no credit
+    EXPECT_EQ(transport.send_credit(id), 0U);
     transport.deliver_ack(id, 6);
-    EXPECT_EQ(transport.send_credit(id), 6U);  // ack frees space
+    EXPECT_EQ(transport.send_credit(id), 6U);
 }
 
 TEST(FakeTcpTransportTest, SendCreditOnStaleIdIsZero) {
     FakeTcpTransport transport;
     const ConnectionId id = transport.connect();
-    transport.reset_peer(id);  // slot freed; id now stale
+    transport.reset_peer(id);
     EXPECT_EQ(transport.send_credit(id), 0U);
 }
 
@@ -103,7 +103,6 @@ TEST(FakeTcpTransportTest, AckFreesCreditAndFiresWritable) {
     EXPECT_EQ(transport.writable_events()[0].first, id);
     EXPECT_EQ(transport.writable_events()[0].second, 5U);
 
-    // Freed space is now usable.
     EXPECT_EQ(transport.send(id, bytes(iota_bytes(5, 100))), 5U);
 }
 
@@ -118,11 +117,11 @@ TEST(FakeTcpTransportTest, DeliverThrottlesByReceiveWindow) {
     const ConnectionId id = transport.connect();
 
     auto data = iota_bytes(10);
-    EXPECT_EQ(transport.deliver(id, bytes(data)), 4U);  // window is 4
+    EXPECT_EQ(transport.deliver(id, bytes(data)), 4U);
     EXPECT_EQ(transport.rx_unacked(id), 4U);
-    EXPECT_EQ(transport.deliver(id, bytes(data)), 0U);  // window closed
+    EXPECT_EQ(transport.deliver(id, bytes(data)), 0U);
 
-    // Consuming reopens the window (AR-6 flow control).
+    // Consuming reopens the receive window (AR-6).
     transport.consume(id, 4);
     EXPECT_EQ(transport.rx_unacked(id), 0U);
     EXPECT_EQ(transport.deliver(id, bytes(data)), 4U);
@@ -152,11 +151,11 @@ TEST(FakeTcpTransportTest, PeerCloseReportsGracefulReason) {
 TEST(FakeTcpTransportTest, OperationsOnStaleIdAreSafeNoOps) {
     FakeTcpTransport transport;
     const ConnectionId id = transport.connect();
-    transport.reset_peer(id);  // id is now stale
+    transport.reset_peer(id);
 
     EXPECT_EQ(transport.send(id, bytes(iota_bytes(4))), 0U);
-    transport.consume(id, 4);      // no crash
-    transport.deliver_ack(id, 4);  // no crash
+    transport.consume(id, 4);
+    transport.deliver_ack(id, 4);
     EXPECT_EQ(transport.deliver(id, bytes(iota_bytes(4))), 0U);
     EXPECT_FALSE(transport.is_open(id));
 }
@@ -165,14 +164,13 @@ TEST(FakeTcpTransportTest, ReusedSlotDoesNotResolveOldId) {
     FakeTcpTransport transport;
     const ConnectionId first = transport.connect();
     transport.reset_peer(first);
-    const ConnectionId second =
-        transport.connect();  // reuses the physical slot
+    const ConnectionId second = transport.connect();
 
     EXPECT_NE(first, second);
     EXPECT_FALSE(transport.is_open(first));
     EXPECT_TRUE(transport.is_open(second));
     transport.send(second, bytes(iota_bytes(3)));
-    EXPECT_EQ(transport.sent_bytes(first).size(), 0U);  // old id inert
+    EXPECT_EQ(transport.sent_bytes(first).size(), 0U);
     EXPECT_EQ(transport.sent_bytes(second).size(), 3U);
 }
 
@@ -183,7 +181,6 @@ TEST(FakeTcpTransportTest, CloseClientDrainsThenReportsServerClosed) {
     transport.send(id, bytes(iota_bytes(10)));
 
     transport.close_client(id);
-    // Still draining: not closed until the queued bytes are acked.
     EXPECT_TRUE(transport.is_open(id));
     EXPECT_TRUE(transport.disconnects().empty());
 
@@ -218,11 +215,9 @@ TEST(FakeTcpTransportTest, ListenRecordsPortAndHonoursOverride) {
     EXPECT_EQ(transport.last_port(), 8080U);
 }
 
-// --- Deferred disconnect delivery (TransportBase) ---------------------------
-//
-// A close issued from inside a transport callback must not re-enter the
-// application through on_disconnect while that callback is still on the stack.
-// The slot goes stale immediately; only the notification waits.
+// A callback-initiated close must not re-enter the application through
+// on_disconnect before that callback returns. The id becomes stale
+// immediately.
 
 TEST(FakeTcpTransportTest,
      CloseFromInsideCallbackDefersDisconnectNotification) {
@@ -242,10 +237,10 @@ TEST(FakeTcpTransportTest,
     transport.set_on_receive([&](ConnectionId client,
                                  std::span<const std::uint8_t>) {
         inside_receive = true;
-        transport.close_client(client);  // nothing queued: drains immediately
-        // The id is stale the moment the slot is released...
+        transport.close_client(client);  // No queued bytes delay teardown here.
+        // The id becomes stale when the slot is released.
         EXPECT_FALSE(transport.is_open(client));
-        // ...but the notification has not been delivered yet.
+        // The disconnect notification is still deferred.
         EXPECT_FALSE(disconnect_seen);
         inside_receive = false;
     });
@@ -320,10 +315,8 @@ TEST(FakeTcpTransportTest,
     EXPECT_EQ(delivered, 2U);
 }
 
-// Delivering a deferred disconnect runs at callback depth 0, so a sink that
-// re-enters the transport from on_disconnect opens a fresh CallbackScope whose
-// unwind flushes again. That nested flush must not replay the entries the
-// outermost pass has already delivered.
+// Re-entry from on_disconnect opens a nested CallbackScope. Its flush must
+// not replay disconnects already delivered by the outer flush.
 TEST(FakeTcpTransportTest, ReentrantFlushDeliversEachDisconnectExactlyOnce) {
     FakeTcpTransport transport;
     const ConnectionId first = transport.connect();
@@ -333,13 +326,12 @@ TEST(FakeTcpTransportTest, ReentrantFlushDeliversEachDisconnectExactlyOnce) {
     transport.set_on_disconnect([&](ConnectionId, DisconnectReason) {
         ++delivered;
         ASSERT_LE(delivered, 8U) << "disconnects are being redelivered";
-        // A sink that touches the transport from its disconnect handler.
         transport.close_server();
     });
 
     transport.reset_peer(first);
 
-    EXPECT_EQ(delivered, 2U);  // one per live connection, no repeats
+    EXPECT_EQ(delivered, 2U);
 }
 
 TEST(FakeTcpTransportTest, IsOpenDistinguishesFullRingFromDeadConnection) {
@@ -347,23 +339,20 @@ TEST(FakeTcpTransportTest, IsOpenDistinguishesFullRingFromDeadConnection) {
     transport.set_send_capacity(4);
     const ConnectionId id = transport.connect();
 
-    // A full ring accepts nothing, but the connection is still open.
     const std::vector<std::uint8_t> data = iota_bytes(8);
     EXPECT_EQ(transport.send(id, bytes(data)), 4U);
     EXPECT_EQ(transport.send(id, bytes(data)), 0U);
     EXPECT_TRUE(transport.is_open(id));
 
-    // A dead connection also accepts nothing — is_open() is what separates
-    // "retry on the next writable" from "stop".
+    // A zero send result alone cannot distinguish backpressure from a dead
+    // connection.
     transport.reset_peer(id);
     EXPECT_EQ(transport.send(id, bytes(data)), 0U);
     EXPECT_FALSE(transport.is_open(id));
 }
 
-// deliver_segmented()'s own three clauses. The helper is the only way to raise
-// a teardown *between* segments of one arrival, so it stands in for the lwIP
-// recv callback's mid-chain `if (!self->is_open(id)) break;`. A service-level
-// test that drives it cannot tell which of two mechanisms held; these can.
+// A segmented arrival can tear down between segments within one
+// CallbackScope.
 
 TEST(FakeTcpTransportTest, DeliverSegmentedReportsWhatItDelivered) {
     FakeTcpTransport transport;
@@ -394,15 +383,11 @@ TEST(FakeTcpTransportTest, DeliverSegmentedStopsWhenTheWindowCloses) {
             seen.append(data.begin(), data.end());
         });
 
-    // Four bytes fit whole; the next segment is truncated to the two bytes of
-    // window that remain; the third never arrives at all.
     const std::array<std::string_view, 3> segments{"abcd", "efgh", "ijkl"};
     EXPECT_EQ(transport.deliver_segmented(id, segments), 6U);
     EXPECT_EQ(seen, "abcdef");
     EXPECT_EQ(calls, 2);
 
-    // The connection is still open: a closed window is back-pressure, not a
-    // teardown, and the rest arrives once the peer consumes.
     EXPECT_TRUE(transport.is_open(id));
     transport.consume(id, 6);
     EXPECT_EQ(transport.deliver_text(id, "ijkl"), 4U);
@@ -420,18 +405,13 @@ TEST(FakeTcpTransportTest, DeliverSegmentedStopsWhenTheConnectionGoesAway) {
             }
         });
 
-    // The handler tears the connection down on the second segment, so the third
-    // is never delivered and the return counts only what arrived.
     const std::array<std::string_view, 3> segments{"ab", "cd", "ef"};
     EXPECT_EQ(transport.deliver_segmented(id, segments), 4U);
     EXPECT_EQ(calls, 2);
     EXPECT_FALSE(transport.is_open(id));
 }
 
-// close_server()'s second clause -- "and stop listening". The double modelled
-// only the teardown half, so a connection offered after stop() was admitted
-// here and RST by the firmware: the fake reported the opposite of the transport
-// it stands for, on the one clause the method exists to provide.
+// A stopped listener accepts no new connection.
 
 TEST(FakeTcpTransportTest, ConnectAfterCloseServerIsRefusedWithoutACallback) {
     FakeTcpTransport transport;
@@ -447,9 +427,8 @@ TEST(FakeTcpTransportTest, ConnectAfterCloseServerIsRefusedWithoutACallback) {
     transport.close_server();
     EXPECT_TRUE(transport.server_closed());
 
-    // No listening pcb: the peer gets a RST and nothing reaches the service.
-    // Not on_refused, which models a slot-table refusal (RR-3) the service does
-    // see -- so neither callback fires.
+    // No listener means neither service callback fires. Slot exhaustion
+    // instead calls on_refused (RR-3).
     EXPECT_FALSE(transport.connect().valid());
     EXPECT_EQ(connects, 1);
     EXPECT_EQ(refusals, 0);
@@ -461,14 +440,11 @@ TEST(FakeTcpTransportTest, ListenAfterCloseServerAcceptsAgain) {
     transport.close_server();
     ASSERT_FALSE(transport.connect().valid());
 
-    // A stop/restart cycle: the real transport binds a fresh listening pcb, so
-    // the door reopens. Without this the flag latched for the object's life and
-    // a restart could not be tested at all.
+    // Restarting restores listening after close_server().
     EXPECT_TRUE(transport.listen(8080));
     EXPECT_FALSE(transport.server_closed());
     EXPECT_TRUE(transport.connect().valid());
 
-    // A failed listen leaves it closed rather than pretending otherwise.
     transport.close_server();
     transport.set_listen_result(false);
     EXPECT_FALSE(transport.listen(80));
@@ -491,10 +467,8 @@ TEST(FakeTcpTransportTest, NoTimeoutSweepRunsAfterCloseServer) {
     transport.arm_timeout(id, pico_http::TimeoutKind::IDLE, 1000);
     transport.close_server();
 
-    // close_server() removes the timeout worker from the async context, so no
-    // sweep runs afterwards however far the clock is advanced. The disconnect
-    // these connections got was SERVER_CLOSED, delivered by
-    // close_all_clients().
+    // The timeout worker stops with the server, so advancing time cannot
+    // change the disconnect reason.
     transport.advance_time(10000);
     EXPECT_EQ(timeouts, 0);
 }

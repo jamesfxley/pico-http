@@ -15,29 +15,19 @@
 #include "pico_util/bytes/as_bytes.hpp"
 
 /// \file response_writer.hpp
-/// Drives one response onto the wire under backpressure. The writer owns the
-/// serialized head, the body source and the cursors into both, and advances
-/// through an explicit state rather than through a set of independent flags:
-/// every send path has to leave the writer resumable from the next writable
-/// event, which is only checkable if "where am I" is one value.
-///
-/// Framing for a length-less body (NR-6) is chosen by the caller and handed
-/// over in begin(): chunked for HTTP/1.1, raw close-delimited for the HTTP/1.0
-/// downgrade.
+/// Resumable response output. The caller selects chunked or close-delimited
+/// framing for unknown-length bodies (NR-6).
 
 namespace pico_http::detail {
 
-/// The two service counters the writer moves. Bundled by reference so the
-/// writer stays independent of HttpService::Statistics. This is a call-scoped
-/// parameter aggregate — constructed at the call site, never stored — so the
-/// usual objection to reference members (surprising copy and assignment
-/// semantics on a long-lived object) does not apply.
+/// Call-scoped references to service counters. The aggregate is not stored.
+// cppcoreguidelines-avoid-const-or-ref-data-members: calls bound lifetime.
 // NOLINTBEGIN(cppcoreguidelines-avoid-const-or-ref-data-members)
 struct WriteCounters {
     std::uint64_t& bytes_out;
     std::uint32_t& backpressure_events;
 };
-// Closes the region opened above; the call-scoped-aggregate reason is there.
+// cppcoreguidelines-avoid-const-or-ref-data-members: scope ends here.
 // NOLINTEND(cppcoreguidelines-avoid-const-or-ref-data-members)
 
 /// How a body of unknown length is delimited.
@@ -56,20 +46,11 @@ enum class PumpResult : std::uint8_t {
     COMPLETE,
     /// The transmit ring is full. Resume on the next writable event.
     STALLED,
-    /// The response cannot be continued correctly; the caller must close.
-    /// Raised when a generator quits early, or when a transport accepts less
-    /// than the credit it advertised mid-frame.
+    /// The caller must close after an early generator end or a partial frame.
     ABORT,
-    /// The connection is gone. A send accepting nothing is ambiguous on its
-    /// own — a full ring and a dead connection both accept zero — so the
-    /// writer asks the transport which it was. Without this the response would
-    /// park waiting for a writable event that can never arrive, and only the
-    /// TR-4 write timeout would eventually reclaim the slot.
-    ///
-    /// A slot already draining towards close is deliberately not DEAD: both
-    /// transports refuse sends on it while is_open() still reports it live, so
-    /// it reads as STALLED and is bounded by the shorter TR-5 drain linger
-    /// rather than by TR-4.
+    /// The connection is gone, so no writable event will follow. A draining
+    /// connection reads as STALLED, bounded by the TR-5 linger rather than the
+    /// TR-4 write timeout.
     DEAD,
 };
 
@@ -94,9 +75,7 @@ class ResponseWriter {
         LAST_CHUNK,
     };
 
-    /// Writable view of the head buffer, for the caller to serialize into
-    /// before begin(). Serialization is the caller's job because the framing
-    /// decisions it makes depend on request context and keep-alive policy.
+    /// Head storage for the caller to serialise before begin().
     std::span<std::uint8_t> head_buffer() noexcept { return head_; }
 
     /// Start emitting a response whose head occupies the first `head_len` bytes
@@ -114,10 +93,8 @@ class ResponseWriter {
         state_ = continue_pending() ? State::CONTINUE : State::HEAD;
     }
 
-    /// Replace the response wholesale with a head that is already serialized
-    /// into head_buffer(), dropping any body. Used for the fixed 500 fallback
-    /// (BR-13, BR-14), and for HEAD, which carries the head with no body (RFC
-    /// 9110 §9.3.2) and, for a chunked framing, no last-chunk either.
+    /// Use the serialised head without a body or last-chunk (BR-13, BR-14;
+    /// RFC 9110 §9.3.2).
     void drop_body() noexcept {
         body_.reset();
         body_sent_ = 0;
@@ -207,12 +184,8 @@ class ResponseWriter {
     }
 
    private:
-    // Fixed width of the hex chunk-size field for a chunked response (NR-6).
-    // Zero-padded (RFC 9112 §7.1 chunk-size = 1*HEXDIG permits leading zeros)
-    // so the size line is a constant length: the writer reserves it at the
-    // front of the scratch buffer, the generator fills the payload after it,
-    // and the size is back-filled without shifting the payload. 4 digits cover
-    // any single chunk up to 0xFFFF bytes, well above GeneratorChunk.
+    // Hexadecimal chunk-size width in digits. Leading zeros are valid (NR-6;
+    // RFC 9112 §7.1).
     static constexpr std::size_t CHUNK_SIZE_HEX_WIDTH = 4;
     // Framing bytes around one chunk: "XXXX\r\n" prefix + trailing "\r\n".
     static constexpr std::size_t CHUNK_FRAMING_OVERHEAD =
@@ -222,12 +195,8 @@ class ResponseWriter {
     static_assert(GeneratorChunk <= MAX_ENCODABLE_CHUNK,
                   "CHUNK_SIZE_HEX_WIDTH (4 hex digits) must encode any single "
                   "chunk, whose payload never exceeds GeneratorChunk");
-    // The floor the ceiling above implies but does not state. A chunked
-    // generator computes its fill budget as GeneratorChunk - overhead in
-    // std::size_t, so a profile with a smaller chunk wraps that subtraction to
-    // near SIZE_MAX and takes an out-of-range subspan of the scratch buffer.
-    // Nothing else between a downstream profile and that arithmetic bounds the
-    // value: the HttpProfile concept requires only that it exists.
+    // The payload budget subtracts framing overhead in size_t. A smaller
+    // chunk would underflow.
     static_assert(GeneratorChunk > CHUNK_FRAMING_OVERHEAD,
                   "Profile::GENERATOR_CHUNK must leave room for a chunk's own "
                   "framing plus at least one payload byte");
@@ -248,10 +217,7 @@ class ResponseWriter {
         dst[CHUNK_SIZE_HEX_WIDTH + 1] = static_cast<std::uint8_t>('\n');
     }
 
-    // Deliver the not-yet-accepted remainder of the interim 100. The ring may
-    // take the small write only partially (a pipelined request can complete its
-    // head while the previous response still drains), so the remainder resumes
-    // from the cursor, never from offset 0.
+    // Resume a partially accepted interim 100 from its cursor.
     bool flush_continue(ITcpTransport& transport,
                         ITcpTransport::ConnectionId id,
                         WriteCounters counters) {
@@ -295,11 +261,8 @@ class ResponseWriter {
                                  : send_sized_body(transport, id, counters);
     }
 
-    // A body whose length is known up front. The two cases are separate
-    // functions rather than a branch inside one loop because only one of them
-    // needs the generator scratch: sharing the loop put a GeneratorChunk-sized
-    // array in the frame of every buffered and static pump too, on the
-    // async-context stack, for a branch that cannot reach it.
+    // Separate generator output keeps scratch storage off the static and
+    // buffered paths.
     PumpResult send_sized_body(ITcpTransport& transport,
                                ITcpTransport::ConnectionId id,
                                WriteCounters counters) {
@@ -332,20 +295,16 @@ class ResponseWriter {
                                          ITcpTransport::ConnectionId id,
                                          WriteCounters counters) {
         while (body_sent_ < body_.total()) {
-            // Clamp the fill to transmit-ring free space so every generated
-            // byte is accepted by the send() below — never generate bytes the
-            // ring will reject and then re-generate them on the next writable
-            // event. A transport that does not model a ring reports SIZE_MAX,
-            // leaving the fill effectively unclamped.
+            // Bound the fill by ring credit to avoid generating bytes the ring
+            // cannot accept. A transport without a ring reports SIZE_MAX,
+            // which leaves the fill unbounded.
             const std::size_t credit = transport.send_credit(id);
             if (credit == 0) {
                 ++counters.backpressure_events;
                 return stalled_or_dead(transport, id);
             }
-            // Deliberately left uninitialised (no `{}`): the generator
-            // overwrites the region it fills and only the `produced` prefix is
-            // read back, so zeroing it on every pump would be pure waste. It
-            // must outlive the send() below, hence loop-body scope.
+            // The scratch buffer must outlive send().
+            // cppcoreguidelines-pro-type-member-init: all reads follow writes.
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
             std::array<std::uint8_t, GeneratorChunk> scratch;
             const std::size_t want =
@@ -367,13 +326,9 @@ class ResponseWriter {
         return PumpResult::COMPLETE;
     }
 
-    // A length-less generator body (NR-6): pull ring-sized chunks until the
-    // generator returns 0. send_credit bounds each write so a framed chunk is
-    // accepted whole — chunk framing is not offset-addressable, so a
-    // partial-frame resumption must never arise.
-    // One resumable state machine over the chunked-framing rules described
-    // above; the branches are the framing cases, and hoisting them out would
-    // separate each from the resumption invariant it maintains.
+    // Credit bounds each frame so partial-frame resumption must never arise
+    // (NR-6).
+    // readability-function-cognitive-complexity: framing shares state.
     // NOLINTNEXTLINE(readability-function-cognitive-complexity)
     PumpResult send_streamed_body(ITcpTransport& transport,
                                   ITcpTransport::ConnectionId id,
@@ -381,9 +336,7 @@ class ResponseWriter {
         const bool chunked = framing_ == Framing::CHUNKED;
         while (true) {
             if (generator_drained_) {
-                // Content is complete. A raw close-delimited stream is done —
-                // the socket close delimits it. A chunked response still owes
-                // the terminating zero-length chunk.
+                // Only chunked framing needs a terminating zero-length chunk.
                 if (!chunked) {
                     return PumpResult::COMPLETE;
                 }
@@ -408,10 +361,9 @@ class ResponseWriter {
                 return stalled_or_dead(transport, id);
             }
 
-            // Chunked layout in scratch: [XXXX\r\n][payload...][\r\n]. The
-            // generator fills the payload region after the reserved size field;
-            // raw framing fills from the front. Left uninitialised for the
-            // reason given in send_sized_body.
+            // Chunk scratch reserves [XXXX\r\n] before the payload and [\r\n]
+            // after it. Raw output fills from the front.
+            // cppcoreguidelines-pro-type-member-init: all reads follow writes.
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
             std::array<std::uint8_t, GeneratorChunk> scratch;
             const std::size_t prefix = chunked ? CHUNK_SIZE_HEX_WIDTH + 2 : 0;
@@ -438,12 +390,8 @@ class ResponseWriter {
                 id, std::span<const std::uint8_t>(scratch.data(), framed_len));
             counters.bytes_out += accepted;
             if (chunked) {
-                // send_credit() guaranteed the whole frame fits, so a short
-                // accept means the transport over-reported its credit. The
-                // partial frame is already committed and chunk framing is not
-                // offset-addressable, so the stream cannot resume without
-                // duplicating bytes. The client sees a truncated chunked body
-                // (a detectable error), never a corrupted one.
+                // A short write contradicts send_credit(). The committed
+                // partial frame cannot resume without duplicating bytes.
                 if (accepted < framed_len) {
                     return PumpResult::ABORT;
                 }

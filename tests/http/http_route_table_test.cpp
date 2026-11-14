@@ -118,7 +118,7 @@ TEST(RouteTableTest, ReRegistrationReplacesHandler) {
     const HTTPRequestView request{};
     HTTPResponse response{};
     route->handler(request, response);
-    EXPECT_EQ(which, 2);  // the later registration replaced the earlier one
+    EXPECT_EQ(which, 2);
 }
 
 TEST(RouteTableTest, ExactMatchWinsOverWildcard) {
@@ -144,17 +144,13 @@ TEST(RouteTableTest, ExactMatchWinsOverWildcard) {
     EXPECT_TRUE(exact_called);
     EXPECT_FALSE(wildcard_called);
 
-    // Method still gates both tables: POST matches neither route.
     EXPECT_EQ(routes.find_route("POST", "/api/v1"), nullptr);
     EXPECT_EQ(routes.find_route("POST", "/api/other"), nullptr);
-    // A non-exact URI falls through to the wildcard.
     EXPECT_NE(routes.find_route("GET", "/api/other"), nullptr);
 }
 
 TEST(RouteTableTest, StoresAMethodOfExactlyMethodCapacityCharacters) {
-    // METHOD_CAPACITY is the usable length, as every other cap in the library
-    // is (BR-2): a caller sizing against the public constant must get a
-    // route, not a silent registration failure.
+    // A method at METHOD_CAPACITY must register without truncation (BR-2).
     RouteTable routes;
     const std::string method(RouteTable::METHOD_CAPACITY, 'M');
 
@@ -164,8 +160,7 @@ TEST(RouteTableTest, StoresAMethodOfExactlyMethodCapacityCharacters) {
                                  }));
     EXPECT_NE(routes.find_route(method, "/long-method"), nullptr);
 
-    // One over is still a refusal, not a truncation that would route the
-    // shorter token by accident.
+    // Truncation could route the shorter token by accident.
     const std::string too_long(RouteTable::METHOD_CAPACITY + 1, 'M');
     EXPECT_FALSE(routes.add_route(too_long, "/too-long",
                                   [](const HTTPRequestView&, HTTPResponse&) {

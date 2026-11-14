@@ -8,19 +8,12 @@
 #include "pico_http/tcp/connection_id.hpp"
 
 /// \file tcp_transport.hpp
-/// Host-safe transport abstraction. Connections are named by generation-tagged
-/// ConnectionId, never raw pointers (AR-4); sends are credit-based and never
-/// silently truncate (AR-5); received bytes are explicitly acknowledged via
-/// consume() so the transport can gate the receive window (AR-6). No lwIP
-/// dependency — the firmware LwipTcpTransport and the host FakeTcpTransport
-/// both implement it. Sizing constants (slot count, MSS, advertised window)
-/// belong to the config module, not to this interface.
+/// Host-safe connection handles, send credit and receive-window control
+/// (AR-4, AR-5, AR-6).
 
 namespace pico_http {
 
-/// Why a connection ended (OR-1). Delivered to the disconnect
-/// callback so the HTTP layer can tell graceful close from RST/timeout — and
-/// which timeout — for its counters.
+/// Disconnect reasons reported to the HTTP counters (OR-1).
 enum class DisconnectReason : std::uint8_t {
     PEER_CLOSED,      // peer sent FIN
     PEER_RESET,       // peer sent RST
@@ -34,12 +27,8 @@ enum class DisconnectReason : std::uint8_t {
     SERVER_CLOSED,    // close_server()/close_client() initiated locally
 };
 
-/// The per-connection timeout currently armed (TR-1..TR-6). Exactly one is
-/// active at a time, reflecting the connection's phase; the HTTP layer re-arms
-/// on each state transition. DRAIN is transport-internal: the HTTP layer never
-/// arms it (arm_timeout rejects it), because the transport arms it itself
-/// inside close_client(). The linger duration is a sizing tunable and lives in
-/// the config module.
+/// The single armed connection deadline. Only the transport arms DRAIN,
+/// inside close_client() (TR-1..TR-6).
 enum class TimeoutKind : std::uint8_t {
     HEADER,   // TR-1
     BODY,     // TR-2
@@ -49,9 +38,7 @@ enum class TimeoutKind : std::uint8_t {
     HANDLER,  // TR-6, deferred handler awaiting respond()
 };
 
-/// Map an armed timeout kind to the DisconnectReason reported when it expires.
-/// Shared by both transports. Exhaustive with no default: a new kind without a
-/// reason is a compile error rather than a silently mis-reported teardown.
+/// Map timeout kinds to disconnect reasons. A missing kind fails compilation.
 inline DisconnectReason timeout_reason(TimeoutKind kind) noexcept {
     switch (kind) {
         case TimeoutKind::HEADER:
@@ -67,15 +54,13 @@ inline DisconnectReason timeout_reason(TimeoutKind kind) noexcept {
         case TimeoutKind::HANDLER:
             return DisconnectReason::TIMEOUT_HANDLER;
     }
-    return DisconnectReason::TIMEOUT_DRAIN;  // unreachable: switch is
-                                             // exhaustive
+    // The switch covers every TimeoutKind.
+    return DisconnectReason::TIMEOUT_DRAIN;
 }
 
-/// Everything a transport reports to its owner. Virtual dispatch rather than
-/// stored std::functions: registration then costs no allocation at all, which
-/// matters because a std::function assignment can allocate and the steady-state
-/// paths must not (AR-1). Every method defaults to a no-op so an implementer
-/// overrides only the events it cares about.
+/// Transport event sink. Registration allocates nothing; steady-state paths
+/// must not allocate (AR-1).
+/// Unimplemented events default to no-ops.
 class ITransportEvents {
    public:
     /// Connection handle these callbacks are addressed with.
@@ -91,9 +76,8 @@ class ITransportEvents {
     /// A connection was accepted and its id issued.
     virtual void on_connect(ConnectionId /*client*/) {}
 
-    /// A connection ended, for the given reason. Delivered after any callback
-    /// on the stack has unwound, so the id stays usable for the whole of the
-    /// callback that caused the close.
+    /// Reports a disconnect after the outermost callback unwinds. The id is
+    /// already stale, but service state remains stable until notification.
     virtual void on_disconnect(ConnectionId /*client*/,
                                DisconnectReason /*reason*/) {}
 
@@ -107,29 +91,20 @@ class ITransportEvents {
     virtual void on_writable(ConnectionId /*client*/,
                              std::size_t /*sendable*/) {}
 
-    /// An inbound connection was refused because no slot was free (RR-3 / OR-1
-    /// refusals_slot_full). Refused at the TCP layer with no HTTP response, so
-    /// there is no ConnectionId to report.
+    /// No slot was free. The TCP connection is rejected without an HTTP
+    /// response or a connection id (RR-3, OR-1).
     virtual void on_refused() {}
 
-    /// The transport reached a turn on which deferred completions may be
-    /// serviced, having been asked to by signal_completion() (AR-9). Runs on
-    /// the same context as every other event here, which is the point:
-    /// respond() may be called from core 1 or an ISR, but the send it leads to
-    /// happens here, on the async-context path, like every other send.
+    /// A turn on the transport context when deferred completions may be
+    /// serviced (AR-9).
+    /// respond() may be called from another core or an ISR. Sending happens
+    /// here.
     virtual void on_poll() {}
 };
 
-/// The TCP seam the HTTP layer is written against.
-///
-/// Everything above this interface — parsing, routing, response assembly,
-/// backpressure, timeouts — is stack-agnostic and host-testable, which is why
-/// only the lwIP glue needs hardware to exercise. LwipTcpTransport implements
-/// it on firmware; FakeTcpTransport implements it for the host suite.
-///
-/// The transport owns connection lifetime and issues the ConnectionId that
-/// names one. It calls into an ITransportEvents sink rather than taking
-/// callbacks, so registration allocates nothing (AR-1).
+/// The network interface used by the portable HTTP layer. The transport owns
+/// connection lifetime and allocates nothing to register its event sink
+/// (AR-1).
 class ITcpTransport {
    public:
     /// Connection handle this transport issues and accepts.
@@ -154,113 +129,69 @@ class ITcpTransport {
     /// still flushed before the socket goes away (DRAIN_CLOSE).
     virtual void close_client(ConnectionId client) = 0;
 
-    /// Credit-based send. Returns the number of bytes accepted into the
-    /// transmit ring (0..data.size()). A short or zero return means the ring is
-    /// full; resume when on_writable fires. Never drops bytes silently.
-    ///
-    /// `data` is borrowed for the duration of the call: an implementation must
-    /// copy the bytes it accepts, not retain the span. This is a requirement
-    /// rather than a convention — the response writer sends from a loop-body
-    /// scratch buffer that goes out of scope on the next iteration, so a
-    /// transport holding the span for an asynchronous write would transmit
-    /// whatever replaced it. Retaining the *copy* is the point:
-    /// LwipTcpTransport keeps its ring's bytes valid until the peer acks them,
-    /// which is what lets it hand lwIP a pointer without TCP_WRITE_FLAG_COPY.
+    /// Returns bytes accepted, from zero to data.size(), never dropping bytes
+    /// silently; resume on on_writable. An implementation must copy
+    /// accepted bytes during the call: the writer reuses its scratch buffer
+    /// after send() returns.
     virtual std::size_t send(ConnectionId client,
                              std::span<const std::uint8_t> data) = 0;
 
-    /// Bytes send() can accept right now — the free space in the transmit ring.
-    /// Lets a producer size its next fill so every byte it generates is
-    /// accepted, rather than generating optimistically and discarding what the
-    /// ring rejects (bounds generator re-invocation under
-    /// backpressure). This is transmit-ring free space, distinct from the
-    /// on_writable `sendable` argument, which is the just-acked delta and does
-    /// not describe ring capacity — clamping a producer by `sendable` would
-    /// stall. Default returns SIZE_MAX (capacity unknown/unbounded) so a
-    /// transport that does not model a ring stays correct without overriding.
+    /// Current ring free space, distinct from the just-acknowledged
+    /// on_writable delta.
+    /// The default SIZE_MAX means unknown or unbounded capacity.
     [[nodiscard]] virtual std::size_t send_credit(
         ConnectionId /*client*/) const {
         return SIZE_MAX;
     }
 
-    /// Acknowledge `bytes` received bytes as consumed by the application. The
-    /// transport reopens that much receive window (delayed tcp_recved); bytes
-    /// left unconsumed hold the window closed — genuine RX flow control.
+    /// Return receive-window credit for bytes consumed. Unconsumed bytes keep
+    /// the window closed.
     virtual void consume(ConnectionId client, std::size_t bytes) = 0;
 
-    /// Arm the single per-connection timeout to fire `ms_from_now` milliseconds
-    /// from now with the given kind, replacing any previously armed one
-    /// (TR-1..TR-4, TR-6). On expiry the connection is torn down and the
-    /// disconnect
-    /// callback
-    /// fires with the matching TIMEOUT_* reason.
+    /// Replace the connection deadline with ms_from_now milliseconds. Expiry
+    /// tears down with the matching reason (TR-1..TR-4, TR-6).
     virtual void arm_timeout(ConnectionId client, TimeoutKind kind,
                              std::uint32_t ms_from_now) = 0;
 
     /// Disarm the per-connection timeout (e.g. a request completed).
     virtual void clear_timeout(ConnectionId client) = 0;
 
-    /// Route transport events to `sink`, which is borrowed, not owned, and
-    /// must outlive the transport. Set it before listen(). Passing nullptr
-    /// detaches, after which events are dropped.
+    /// Borrow the event sink before listen(). The sink must outlive the
+    /// transport; nullptr detaches it.
     virtual void set_event_sink(ITransportEvents* sink) = 0;
 
-    /// True while `client` names a live connection. Distinguishes a send() that
-    /// returned 0 because the ring is full — retry on the next writable — from
-    /// one that returned 0 because the connection is gone, which no amount of
-    /// waiting will fix.
+    /// True for a live connection. A zero-byte send on a dead connection
+    /// cannot resume.
     [[nodiscard]] virtual bool is_open(ConnectionId client) const = 0;
 
-    /// Optional hint: the HTTP layer reports its configured idle window here
-    /// when keep-alive config changes. The authoritative TR-3 idle timeout is
-    /// the one armed via arm_timeout(), so a transport may ignore this —
-    /// hence the default no-op (the lwIP transport does; the fake records it
-    /// so tests can assert the configured value).
+    /// Reports configured idle timing. A transport may ignore the hint;
+    /// arm_timeout() owns the deadline (TR-3).
     virtual void set_idle_timeout(std::uint32_t /*seconds*/) {}
 
-    /// Ask for an on_poll() on a later turn of the transport's own context
-    /// (AR-9). Called by respond(), so it must be safe from any context —
-    /// core 1, an ISR — and must not block, allocate, or touch lwIP.
-    ///
-    /// **Deferred completion is a capability of the transport, not of the
-    /// service.** The default is a no-op, so a transport that neither
-    /// overrides this nor drives on_poll() itself cannot serve a handler that
-    /// returns Disposition::PENDING: respond() records the completion and
-    /// returns true, and the response is never written. It surfaces as a
-    /// connection that hangs until the TR-6 timeout tears it down, not as a
-    /// missing override. A transport that cannot signal must either drive
-    /// on_poll() directly, as the host double does, or document that PENDING
-    /// is unsupported on it.
+    /// Request a later on_poll() on the transport context (AR-9).
+    /// The call must be safe from any context, including an ISR, and must not
+    /// block, allocate or touch lwIP.
+    /// The default does nothing. A transport unable to signal must drive
+    /// on_poll() itself or document PENDING as unsupported; otherwise
+    /// completions wait until TR-6 teardown.
     virtual void signal_completion() {}
 
-    /// Bracket the deferred-completion record (AR-9, AR-3). respond() writes it
-    /// from an arbitrary context while the transport's context reads and clears
-    /// it, so the two stores that publish a completion must not tear. Held for
-    /// pointer stores only: no lwIP call, no allocation, no send. The default
-    /// pair is a no-op because a single-context transport has nothing to
-    /// exclude — the host fake takes it, so host tests exercise the same code
-    /// path the firmware locks.
-    ///
-    /// Whatever the bracket is, it must be valid for the transport's whole
-    /// lifetime: HttpService::stop() closes the server and *then* clears every
-    /// slot under this lock, and a service whose listen() failed still runs
-    /// stop() from its destructor. A lock created in listen() or released in
-    /// close_server() is taken outside its own lifetime on both paths.
+    /// Lock completion records across contexts. Publication stores must not
+    /// tear (AR-9, AR-3).
+    /// The default is inert. The lock must remain valid for the transport
+    /// lifetime, including after close_server() and failed listen(). No send,
+    /// allocation or lwIP call occurs under it.
     virtual void lock_completions() {}
 
-    /// Release what lock_completions() took. Prefer detail::CompletionLock over
-    /// calling this by hand — an early return between the two is what the RAII
-    /// bracket exists to make impossible.
+    /// Release the completion lock. CompletionLock pairs acquisition and
+    /// release across early returns.
     virtual void unlock_completions() {}
 };
 
 namespace detail {
 
-/// RAII bracket over ITcpTransport::lock_completions() (AR-3, AR-9).
-///
-/// Scoped rather than manual because every early return in the completion paths
-/// would otherwise be a place to leave interrupts disabled. Non-copyable and
-/// non-movable: the lock is tied to the scope that took it.
+/// Scope-bound completion lock, released even on an early return (AR-3,
+/// AR-9).
 class CompletionLock {
    public:
     /// Take `transport`'s completion lock for the lifetime of this object. The

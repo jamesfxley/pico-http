@@ -1,31 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Host-side benchmark suite for the pico-http benchmark firmware.
+"""Host-side benchmark for the pico-http benchmark firmware.
 
-Drives the firmware's HTTP endpoints (/ping, /payload/<n>, /stream/<n>,
-/bench/static/<n>, /bench/buffered/<n>, /upload, /stats, /stats/reset, /info,
-/limits, /lwip_stats) over raw sockets. t1-t7 measure
-latency (incl. TTFB), churn, download/upload throughput, concurrency scaling,
-keep-alive semantics, and soak stability; t8-t15 are the spec's robustness
-gates: RST teardown, slowloris, the boundary matrix (incl. chunked decode and
-Expect: 100-continue), 256 KB backpressured download, slow-reader isolation,
-RX flow control, timeout precision, and zero post-init heap growth. t16 checks
-chunked download; t17 (opt-in) compares BUFFERED vs STATIC_VIEW body modes;
-t20 measures aggregate download across max_connections parallel connections.
-Raw sockets (not http.client) so
-truncation, interim responses, and connection-close semantics stay
-observable. Results print as a table and are written to a timestamped JSON
-file. Python 3 standard library only.
-
-Usage:
-    ./bench.py --host 192.168.1.42 [--port 80] [--tests t1,t3,t6]
-               [--sizes 1024,8192] [--upload-sizes 256,2048] [--count N]
-               [--duration 60] [--timeout 5.0] [--output-dir results] [--wait]
-               [--burn-ms 10]
-
-t7 (soak; length via --duration), t14 (timeout precision, slow), t17 (body-mode
-comparison), t18 (copied-body heap mechanism) and t21 (abuse run) are opt-in via
---tests; every other test runs by default.
+README.md describes the routes, tests, usage and why raw sockets are used.
 """
 
 import argparse
@@ -50,100 +27,78 @@ DEFAULT_TESTS = ["t1", "t2", "t3", "t4", "t5", "t6", "t8",
                  "t9", "t10", "t11", "t12", "t13", "t15", "t16",
                  "t19", "t20", "t22"]
 
-# The specification's measurement methodology: at least this many samples
-# behind any p99 claim, and an initial batch issued but not sampled. Both t1
-# and t2 report a p99, so both take the floor. A --count below it is recorded
-# in the result rather than silently accepted.
+# t1 takes this many samples by default for its p99. Both t1 and t2 discard
+# WARMUP_SAMPLES first. A smaller --count is recorded in the result.
 MIN_P99_SAMPLES = 500
 WARMUP_SAMPLES = 50
 
-# Documented expectations and device-internal bounds, held here so a
-# recorded figures and internal timing checks stay tied to their requirement IDs.
-PR3_MIN_AGGREGATE_RPS = 250.0     # PR-3, at the connection cap
-# PR-4 has two clauses and they are measured separately: the accept rate under
-# max_connections workers, and one connection's latency driven serially. The
-# rate expectation is recorded beside the observed distribution.
-PR4_MIN_ACCEPTS_PER_S = 150.0     # PR-4
-# PR-5: the single-connection download expectation, recorded at sizes from
-# 16 KiB up on each size's p10 over PR5_REPS reps, by nearest rank (the second
-# slowest of 20). No speed sample changes its verdict. KB is 1,024 B here,
-# as in every rate this script
-# reports.
+# The concurrent-load expectation is requests per second (PR-3).
+PR3_MIN_AGGREGATE_RPS = 250.0
+# The accept-rate expectation is measured separately from serial latency
+# (PR-4). Its unit is accepts per second (PR-4).
+PR4_MIN_ACCEPTS_PER_S = 150.0
+# The download expectation uses nearest-rank p10 from 16 KiB (PR-5).
+# Rates use 1024-byte KB throughout this script.
 PR5_MIN_KBPS = 400.0
 PR5_REPS = 20
 PR5_PERCENTILE = 10
-# PR-2: the share of receive callbacks (parse, route, handler, serialize) that
-# must finish within the device's 1 ms budget, read from /stats.
+# The share of receive callbacks that must finish processing within 1 ms,
+# read from /stats (PR-2).
 PR2_WITHIN_1MS_SHARE = 0.99
 PR5_MIN_SIZE = 16384
-PR4_MAX_CONNECT_P50_MS = 25.0     # PR-4
-CHURN_LATENCY_SAMPLES = 200       # serial phase, for the p50
-CHURN_RATE_CONNECTIONS = 1600     # concurrent phase, across the workers
-CHURN_STALL_S = 0.1               # a connection this slow is the path, not the server
-RR5_MIN_REUSE_RATE = 0.99         # RR-5
-RR5_REUSE_CYCLES = 8              # connections the reuse rate is measured over
-TIMEOUT_PRECISION_S = 0.2         # the +/- 200 ms every TR row states
-# One segment's delivery while all max_connections slots are saturated, which
-# PR-9's ceiling carries on top of its two RTOs. A quarter-second against a
-# per-request p99 of roughly 150 ms under that load: large enough that the
-# ceiling is reachable when the two-RTO case fires, small enough that a third
-# RTO still fails it by a wide margin.
+# The serial-latency expectation is in ms (PR-4).
+PR4_MAX_CONNECT_P50_MS = 25.0
+# Serial samples estimate p50.
+CHURN_LATENCY_SAMPLES = 200
+# Samples are shared across concurrent workers.
+CHURN_RATE_CONNECTIONS = 1600
+# A churn exchange slower than this, in seconds, counts as a client-path stall.
+CHURN_STALL_S = 0.1
+# The reuse-rate expectation is a fraction (RR-5).
+RR5_MIN_REUSE_RATE = 0.99
+# The reuse rate is measured over this many connections.
+RR5_REUSE_CYCLES = 8
+# The timeout tolerance is in seconds.
+TIMEOUT_PRECISION_S = 0.2
+# The full-load delivery allowance is in seconds and is added to the
+# two-RTO expectation (PR-9).
 BURST_SEGMENT_DELIVERY_S = 0.25
 
-# Copied-body post-init heap, and the mechanism `--tests t18` isolates: a
-# copied set_body allocates one exact-sized buffer, the connection slot takes it
-# over and frees it once the response is sent, and a body over the cap is never
-# copied (BR-14). So live copied-body allocation is at most one body per slot
-# while a response is in flight, hard-bounded by
-# max_connections * max_buffered_body, and zero once the slots are idle. Static
-# and generator bodies allocate zero. This is t7's absolute backstop, derived
-# from device-reported limits rather than a magic number.
+
+# The in-flight copied-body bound uses device-reported limits (BR-14).
 def copied_body_heap_bound(cfg):
     maxc = cfg.info.get("max_connections",
                         cfg.info.get("memp_num_tcp_pcb", 8))
     max_body = cfg.limits.get("max_buffered_body", 2048)
     return maxc * max_body
 
-# The absolute ceiling above bounds the staircase but cannot by itself tell a
-# bounded staircase from a slow leak that happens to stay under it for a short
-# run. The distinguishing evidence is the trajectory: the staircase does all its
-# growth early and then holds flat, while a leak keeps climbing with traffic. So
-# t7 also asserts the tail of the 10 s heap samples is flat within one malloc
-# bucket's worth of digit rollovers. This is the check that actually falsifies a
-# leak; the absolute ceiling is a backstop. Calibration: a 600 s / 56.7 k-request
-# soak reached 1448 B growth in its first ~1.7 k requests and then moved only 16 B
-# over the remaining ~55 k requests, tail spread 8 B (one bucket). The 64 B
-# tolerance is 8x that observed flat tail and catches a leak that slides the
-# 5 min tail by more than ~13 B/min.
+# t7's plateau check passes when the second half of its 10 s free-heap
+# samples spans at most this many bytes; it needs at least
+# HEAP_PLATEAU_MIN_SAMPLES of those samples.
 HEAP_PLATEAU_TOLERANCE_BYTES = 64
 HEAP_PLATEAU_MIN_SAMPLES = 3
 
 
-# --------------------------------------------------------------------------
-# Low-level HTTP over raw sockets
-# --------------------------------------------------------------------------
 class Response:
     def __init__(self, status, headers, body, elapsed_s,
                  short_read=False, server_closed=False, ttfb_s=None):
         self.status = status
-        self.headers = headers          # dict, lowercased keys
-        self.body = body                # bytes
+        # Header keys are lowercased.
+        self.headers = headers
+        # The body is bytes.
+        self.body = body
         self.elapsed_s = elapsed_s
         self.short_read = short_read
         self.server_closed = server_closed
-        self.ttfb_s = ttfb_s            # time to first byte (PR-2); None if
-                                        # unmeasured
+        # First-byte time is in seconds. None means unmeasured (PR-2).
+        self.ttfb_s = ttfb_s
 
 
 class HttpError(Exception):
     pass
 
-
-# Errors that mean "the device could not accept the connection right now",
-# almost always because its tiny TCP PCB pool (MEMP_NUM_TCP_PCB, typically 3)
-# is momentarily saturated by TIME_WAIT entries from recent Connection: close
-# requests. These are transient — the pool drains in a few seconds — so the
-# connection layer retries them rather than failing the whole run.
+# Retries cover transient connection errors, including saturation by lingering
+# PCBs.
 TRANSIENT_ERRNOS = frozenset({
     104,  # ECONNRESET
     111,  # ECONNREFUSED
@@ -165,12 +120,7 @@ def _is_transient(exc):
 
 def connect_with_retry(host, port, timeout, attempts=12, backoff=0.5,
                        max_backoff=2.0):
-    """Open a TCP connection, retrying transient refusals and resets.
-
-    A saturated PCB pool then does not abort the run. Total wait is bounded
-    (~12s by default), which comfortably rides out the observed ~5s pool-drain
-    window.
-    """
+    """Open a TCP connection with bounded retries for transient errors."""
     delay = backoff
     last = None
     for _ in range(attempts):
@@ -189,12 +139,7 @@ def connect_with_retry(host, port, timeout, attempts=12, backoff=0.5,
 
 
 class HttpConn:
-    """A single TCP connection supporting sequential requests.
-
-    Optionally keep-alive. Raw sockets give us the control needed to observe
-    truncation (short reads) and connection-close semantics that http.client
-    hides.
-    """
+    """A raw TCP connection supports sequential requests."""
 
     def __init__(self, host, port, timeout):
         self.host = host
@@ -232,16 +177,10 @@ class HttpConn:
         return self.read_response(start, keep_alive)
 
     def read_response(self, start=None, keep_alive=False):
-        """Parse one HTTP response off the socket.
-
-        Split out of request() so tests can send a hand-crafted (possibly
-        malformed) request and still read the reply.
-        """
+        """Read one response independently of request transmission."""
         if start is None:
             start = time.perf_counter()
-        # TTFB (PR-2): time until this response's first byte. Bytes already
-        # sitting in the buffer (e.g. pipelined ahead) have effectively
-        # arrived, so they count as 0.
+        # Buffered bytes have already arrived and count as zero TTFB (PR-2).
         if self.buf:
             ttfb_s = 0.0
         else:
@@ -251,7 +190,6 @@ class HttpConn:
                 raise HttpError("connection closed before response headers")
             self.buf += first
             ttfb_s = time.perf_counter() - start
-        # Status line + headers.
         if not self.recv_until(b"\r\n\r\n"):
             self.closed = True
             raise HttpError("connection closed before response headers")
@@ -269,7 +207,7 @@ class HttpConn:
                 k, v = line.split(b":", 1)
                 resp_headers[k.decode().strip().lower()] = v.decode().strip()
 
-        # Body framing: Transfer-Encoding: chunked (NR-6) or Content-Length.
+        # The reader handles chunked framing or Content-Length (NR-6).
         if "chunked" in resp_headers.get("transfer-encoding", "").lower():
             body_bytes, short_read = self._read_chunked()
         else:
@@ -297,14 +235,11 @@ class HttpConn:
                         ttfb_s=ttfb_s)
 
     def _read_chunked(self):
-        """Decode a Transfer-Encoding: chunked body off self.buf + socket.
-
-        Returns (body_bytes, short_read).
-        """
+        """Return the decoded chunked body and a short-read flag."""
         body = b""
         try:
             while True:
-                # chunk-size line (chunk extensions after ';' are ignored).
+                # Chunk extensions after the semicolon are ignored.
                 while b"\r\n" not in self.buf:
                     more = self.sock.recv(4096)
                     if not more:
@@ -313,7 +248,6 @@ class HttpConn:
                 line, self.buf = self.buf.split(b"\r\n", 1)
                 size = int(line.split(b";", 1)[0].strip() or b"0", 16)
                 if size == 0:
-                    # Consume the final CRLF terminating the (empty) trailer.
                     while b"\r\n" not in self.buf:
                         more = self.sock.recv(4096)
                         if not more:
@@ -322,7 +256,6 @@ class HttpConn:
                     if self.buf.startswith(b"\r\n"):
                         self.buf = self.buf[2:]
                     return body, False
-                # chunk-data + trailing CRLF.
                 while len(self.buf) < size + 2:
                     more = self.sock.recv(4096)
                     if not more:
@@ -342,11 +275,7 @@ class HttpConn:
 
 def one_shot(host, port, timeout, method, path, body=b"", extra_headers=None,
              attempts=4):
-    """Connect, make a single request, and close, retrying the whole exchange.
-
-    The device may reset mid-flight (PCB pool churn). connect_with_retry
-    handles the connect phase; this handles a reset after the request is sent.
-    """
+    """Retry a single exchange after connection errors or a mid-flight reset."""
     last = None
     for _ in range(attempts):
         conn = HttpConn(host, port, timeout)
@@ -354,7 +283,7 @@ def one_shot(host, port, timeout, method, path, body=b"", extra_headers=None,
             return conn.request(method, path, body, extra_headers,
                                 keep_alive=False)
         except HttpError as exc:
-            last = exc  # e.g. server closed before headers — retry.
+            last = exc
             time.sleep(0.5)
         except OSError as exc:
             last = exc
@@ -366,9 +295,6 @@ def one_shot(host, port, timeout, method, path, body=b"", extra_headers=None,
     raise last or HttpError("one_shot failed")
 
 
-# --------------------------------------------------------------------------
-# Device helpers
-# --------------------------------------------------------------------------
 def get_json(host, port, timeout, path):
     resp = one_shot(host, port, timeout, "GET", path)
     return json.loads(resp.body.decode())
@@ -383,12 +309,7 @@ def get_stats(host, port, timeout):
 
 
 def reset_stats(host, port, timeout):
-    """Zero the device's counters; return its reply.
-
-    The reply names the connections open as the counters zeroed
-    (`active_connections`, this one included), which a check that accepts and
-    disconnects balance needs: those connections close after the zero.
-    """
+    """Reset counters and return the reply, including connections open at reset."""
     resp = one_shot(host, port, timeout, "POST", "/stats/reset")
     try:
         return json.loads(resp.body.decode())
@@ -431,18 +352,11 @@ def percentiles(samples_ms):
     }
 
 
-# --------------------------------------------------------------------------
-# Tests
-# --------------------------------------------------------------------------
 def t1_latency(cfg):
-    """Sequential GET /ping over keep-alive connections.
+    """Request latency (PR-1) and first-byte timing (PR-2) are recorded.
 
-    Reports the total request-response latency (PR-1) and the TTFB split
-    (PR-2): time to the first response byte vs time to completion. Gates PR-2's
-    internal share: at least PR2_WITHIN_1MS_SHARE of the device's receive
-    callbacks over the measured requests (and the reset's own) process within
-    1 ms, up to their first send. The whole callback, the radio handoff
-    included, is recorded beside it. The latency figures carry no verdict.
+    The internal processing share gates; whole-callback timing is review
+    evidence (PR-2).
     """
     n = cfg.count or MIN_P99_SAMPLES
     warmup = getattr(cfg, "warmup", WARMUP_SAMPLES)
@@ -451,9 +365,8 @@ def t1_latency(cfg):
     ttfb_samples = []
     conn = None
     sent_on_conn = 0
-    # The warm-up requests go over the same connections and are issued the same
-    # way; only the clock and the sample lists start after them, so the first
-    # DHCP/ARP/link-warm request cannot land in a p99.
+    # Warm-up uses the measured connections, excluding initial link setup from
+    # p99.
     start = None
     for index in range(warmup + n):
         if conn is None or sent_on_conn >= max_per_conn:
@@ -462,7 +375,6 @@ def t1_latency(cfg):
             conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
             sent_on_conn = 0
         if index == warmup:
-            # The device's receive sample covers the measured requests only.
             reset_stats(cfg.host, cfg.port, cfg.timeout)
             start = time.perf_counter()
         resp = conn.request("GET", "/ping")
@@ -486,14 +398,15 @@ def t1_latency(cfg):
     stats = _safe_stats(cfg) or {}
     timed = stats.get("receive_samples", 0)
     within = stats.get("receive_within_1ms", 0)
-    # The samples include the /stats/reset request's own callback, which is
-    # recorded after the zero; it is one in n + 1.
+    # The reset callback is sampled after zeroing, contributing one of n + 1
+    # samples.
     result["internal"] = {
         "receive_samples": timed,
         "receive_within_1ms": within,
         "receive_max_us": stats.get("receive_max_us"),
         "target_share": PR2_WITHIN_1MS_SHARE,
-        # Recorded, not judged: the whole callback, the radio handoff included.
+        # Whole-callback timing includes radio handoff and is recorded for
+        # review.
         "receive_total_within_1ms": stats.get("receive_total_within_1ms"),
         "receive_total_max_us": stats.get("receive_total_max_us"),
     }
@@ -502,28 +415,15 @@ def t1_latency(cfg):
 
 
 def t2_churn(cfg):
-    """Measure the device's accept rate and one connection's latency (PR-4).
+    """Record parallel accept rate and serial latency (PR-4).
 
-    PR-4 states two things and they need different instruments.
-
-    The rate is a property of the server, so the client must not be the
-    bottleneck. Driven serially it is: the next connection is offered only once
-    the previous one finishes, so every client-side hesitation idles the device
-    and its own accept counter reads back exactly the client's completion rate.
-    Driven by `max_connections` workers there is always a connection pending, a
-    stall in one worker is absorbed by the others, and the counter measures the
-    device. The client's completion rate is reported beside it: the gap between
-    the two is the path's contribution, which belongs in the record as an
-    observation beside the recorded figure.
-
-    The latency is a property of one exchange, and concurrency would inflate it
-    by however many workers are queued ahead. It is measured serially, which is
-    what a caller opening a connection actually sees.
+    The client must not limit accept load; serial requests include client idle
+    time (PR-4).
     """
     workers = cfg.info.get("max_connections", 8)
     warmup = getattr(cfg, "warmup", WARMUP_SAMPLES)
 
-    # --- serial phase: one connection's latency (PR-4's p50 clause) ---
+    # The serial phase measures connection latency (PR-4).
     latency = []
     failures = 0
     for index in range(warmup + CHURN_LATENCY_SAMPLES):
@@ -540,7 +440,7 @@ def t2_churn(cfg):
 
     settle(cfg, quiet_s=0.5, deadline_s=20)
 
-    # --- concurrent phase: the device's accept rate (PR-4's rate clause) ---
+    # The concurrent phase measures accept rate (PR-4).
     target = cfg.count or CHURN_RATE_CONNECTIONS
     per_worker = max(1, target // workers)
     completed = [0] * workers
@@ -575,8 +475,7 @@ def t2_churn(cfg):
     elapsed = time.monotonic() - started
     after = _safe_stats(cfg)
 
-    # The two stats reads are themselves accepted connections; one falls inside
-    # the interval.
+    # One stats connection is accepted inside the measurement interval.
     accepts = None
     if before and after:
         accepts = after.get("accepts", 0) - before.get("accepts", 0) - 1
@@ -605,16 +504,15 @@ def t2_churn(cfg):
         "target_p50_ms": PR4_MAX_CONNECT_P50_MS,
     }
     result.update(percentiles(latency))
-    # PR-4 rates/latency are review evidence; failed exchanges still fail.
+    # Failed exchanges fail the case; speed is review evidence (PR-4).
     result["pass"] = bool(failures == 0 and device_rate is not None)
     return result
 
 
 def t3_download(cfg):
-    # PR-5: single-connection download throughput.
-    """Throughput vs response size; detects the truncation ceiling.
+    # Single-connection throughput (PR-5).
+    """Record throughput by response size (PR-5).
 
-    Record each swept size's p10/median/min against the PR-5 expectation.
     Every transfer must complete bit-exactly; speed is assessed at review.
     """
     sizes = cfg.sizes or DEFAULT_DOWNLOAD_SIZES
@@ -634,8 +532,8 @@ def t3_download(cfg):
                 received_min = min(received_min, len(resp.body))
                 if resp.short_read or len(resp.body) < size:
                     truncated = True
-                    # Let the half-open connection expire server-side before
-                    # the next rep so we do not exhaust the PCB pool.
+                    # The delay lets the half-open connection expire so
+                    # repetitions do not exhaust the device's PCB pool.
                     time.sleep(1.0)
                     _recover(cfg)
                     continue
@@ -658,14 +556,11 @@ def t3_download(cfg):
             "kbps_avg": round(statistics.mean(throughputs), 1) if throughputs else None,
             "kbps_median": (round(statistics.median(throughputs), 1)
                             if throughputs else None),
-            # PR-5 records the p10 rep; the slowest is recorded beside it.
+            # The slowest repetition is recorded beside p10 (PR-5).
             "kbps_p10": _nearest_rank(throughputs, PR5_PERCENTILE),
             "kbps_min": round(min(throughputs), 1) if throughputs else None,
             "truncated": truncated,
-            # v2 has no send-error counter (sends never silently fail — they
-            # backpressure). backpressure_events > 0 during the sweep confirms
-            # the resumable writer actually paused and resumed rather than
-            # dropping bytes (AR-5).
+            # A nonzero backpressure count confirms the writer paused (AR-5).
             "backpressure_events": stats.get("backpressure_events") if stats else None,
         })
         if complete == reps:
@@ -673,7 +568,8 @@ def t3_download(cfg):
     result = {"per_size": per_size, "max_reliable_size": max_reliable,
               "target_kbps": PR5_MIN_KBPS, "judged_from_size": PR5_MIN_SIZE,
               "judged_percentile": PR5_PERCENTILE}
-    # PR-5 records speed; completion/integrity remain mechanised (AR-5).
+    # Completion and integrity decide the verdict; speed is recorded (PR-5,
+    # AR-5).
     result["pass"] = all(e["complete"] == reps and not e["truncated"]
                          for e in per_size)
     return result
@@ -688,8 +584,8 @@ def _nearest_rank(samples, percentile):
 
 
 def t4_upload(cfg):
-    # PR-7: buffered upload throughput, up to the 413 boundary.
-    """Upload throughput + integrity; probes the request-too-large ceiling."""
+    # Buffered upload throughput up to the 413 boundary (PR-7).
+    """Upload throughput and integrity cover the body-size boundary."""
     sizes = cfg.upload_sizes or DEFAULT_UPLOAD_SIZES
     per_size = []
     max_reliable = 0
@@ -722,11 +618,10 @@ def t4_upload(cfg):
 
 
 def t5_concurrency(cfg):
-    # PR-3: connection scaling to the slot cap. RR-3: the round past the cap.
-    """Parallel keep-alive /ping workers; verifies the connection cap."""
-    # max_connections is the v2 application-level slot cap (spec BR-6); older
-    # firmware only exposed the underlying lwIP PCB pool size, which is now
-    # deliberately larger (headroom for TIME_WAIT/mDNS) and not the real cap.
+    # Connection scaling reaches the slot cap (PR-3). The extra worker checks
+    # rejection (RR-3).
+    """Parallel keep-alive workers check the connection cap."""
+    # The application slot cap differs from the larger PCB pool (BR-6).
     max_conns = cfg.info.get("max_connections", cfg.info.get("memp_num_tcp_pcb", 3))
     per_n = []
     lock_samples, lock_max_us, lock_p99_ok = 0, None, False
@@ -736,10 +631,8 @@ def t5_concurrency(cfg):
         failures = [0] * n
         stop = threading.Event()
 
-        # stop/counts/failures are bound as defaults rather than captured: the
-        # threads are joined before the next round rebinds them, but a closure
-        # over the loop variables would silently start reading the next round's
-        # state if that ordering ever changed.
+        # Default arguments bind round state so a changed join order cannot
+        # expose the next round to running threads.
         def worker(idx, stop=stop, counts=counts, failures=failures):
             conn = None
             sent = 0
@@ -778,32 +671,32 @@ def t5_concurrency(cfg):
             "completed": sum(counts),
             "rps": round(sum(counts) / total, 1),
             "worker_failures": worker_failures,
-            # Slot-exhaustion refusals (RR-3 / OR-1).
+            # Slot-exhaustion rejections are counted (RR-3 / OR-1).
             "refusals_slot_full_delta": (
                 stats.get("refusals_slot_full") if stats else None),
         })
-        # AR-3: sample lwIP-lock hold under the full-slot load round (n == cap).
+        # Lock-hold timing is sampled at the connection cap (AR-3).
         if n == max_conns and stats:
             lock_samples = stats.get("lock_hold_samples", 0)
             lock_within = stats.get("lock_hold_within_500us", 0)
             lock_max_us = stats.get("lock_hold_max_us")
-            # p99 <= 500 us <=> at least 99% of spans were within budget.
+            # A 99% within-budget share corresponds to p99 at 500 us.
             lock_p99_ok = (lock_samples > 0 and
                            lock_within / lock_samples >= 0.99)
-        time.sleep(2)  # Let TIME_WAIT / lingering PCBs clear between rounds.
-    # The lock-hold instrumentation is compiled out in release builds (NDEBUG:
-    # zero samples). AR-3 is a debug-only measurement, so a release build reports
-    # it as not-measured rather than failing a gate it cannot evaluate.
+        # Lingering PCBs clear between rounds.
+        time.sleep(2)
+    # Release builds compile out lock-hold sampling, so zero samples mean
+    # unmeasured (AR-3).
     ar3_measured = lock_samples > 0
 
-    # PR-3 is review evidence; workload errors, RR-3 and AR-3 still fail.
+    # Workload errors and internal checks fail the case; speed is review
+    # evidence (PR-3, RR-3, AR-3).
     at_cap = next((e for e in per_n if e["n"] == max_conns), None)
     over_cap = next((e for e in per_n if e["n"] == max_conns + 1), None)
     workload_ok = bool(at_cap and at_cap["worker_failures"] == 0
                        and at_cap["completed"] > 0)
-    # The cap+1 round refuses exactly the one connection over the cap, and the
-    # workers holding the other slots keep going -- so one failed worker is the
-    # expected result and more than one is RR-3's "unaffected" clause breaking.
+    # The cap+1 round expects one failed worker. Extra failures affect
+    # connections already holding slots (RR-3).
     refusals = (over_cap or {}).get("refusals_slot_full_delta")
     rr3_pass = bool(over_cap
                     and refusals is not None and refusals >= 1
@@ -828,13 +721,10 @@ def t5_concurrency(cfg):
 
 
 def t6_keepalive(cfg):
-    """Verify the keep-alive cap, the Connection headers, and RR-5's reuse rate.
+    """Check the keep-alive header, the request cap and connection reuse (RR-5).
 
-    RR-5 is a rate, so it needs a denominator: every request after the first on
-    a connection and within the configured limit is one the client asked to
-    reuse. A server closing early makes the remaining requests on that
-    connection unissued, and they count against the rate rather than vanishing
-    from it.
+    Unissued requests after an early close count against the reuse rate
+    (RR-5).
     """
     limit = cfg.info.get("keep_alive_max_requests", 16)
     conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
@@ -866,7 +756,6 @@ def t6_keepalive(cfg):
     reuses_honoured = 0
     premature_closes = 0
     for _ in range(RR5_REUSE_CYCLES):
-        # Requests 2..limit on this connection are the ones relying on reuse.
         reuse_attempts += limit - 1
         reuse_conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
         try:
@@ -900,11 +789,9 @@ def t6_keepalive(cfg):
 
 
 def t7_soak(cfg):
-    """Mixed load for --duration seconds; watches heap and error drift.
+    """Mixed load checks errors, slots, counters and lwIP allocation (RR-4).
 
-    RR-4 gates: no request errors, heap inside AR-1's bound and flat, every slot
-    free once the load stops, and a counter set that accounts for every
-    connection since the reset.
+    Heap stays bounded and flat (AR-1).
     """
     duration = cfg.duration
     open_at_reset = reset_stats(cfg.host, cfg.port, cfg.timeout).get(
@@ -946,19 +833,13 @@ def t7_soak(cfg):
     if conn:
         conn.close()
     end_stats = get_stats(cfg.host, cfg.port, cfg.timeout)
-    # RR-4 gate: zero error drift, and copied-body heap within the proven hard
-    # bound (max_connections * max_buffered_body; spec AR-1). In this soak the
-    # only copied body is /stats, which a slot frees once it is sent, so real
-    # growth is near zero, well under the bound — the bound is the invariant
-    # backstop, the plateau below is the tight leak detector.
+    # The absolute copied-body bound is independent of the plateau check
+    # (RR-4, AR-1).
     bound = copied_body_heap_bound(cfg)
     growth = end_stats.get("post_init_heap_growth_bytes")
     heap_ok = growth is not None and growth <= bound
-    # Plateau check: free-heap samples decrease as heap grows, so a flat tail
-    # (spread within one digit-rollover bucket) is heap holding steady; a leak
-    # keeps the tail sliding down. Needs enough tail
-    # samples to judge; a short soak that never reaches HEAP_PLATEAU_MIN_SAMPLES
-    # is not asserted against (the bound still applies), only reported.
+    # A flat free-heap tail detects continued growth below the absolute bound.
+    # Short runs lacking enough tail samples report the plateau as unmeasured.
     tail = [s for s in heap_samples if s is not None]
     tail = tail[len(tail) // 2:]
     if len(tail) >= HEAP_PLATEAU_MIN_SAMPLES:
@@ -966,9 +847,8 @@ def t7_soak(cfg):
         plateau_ok = plateau_spread <= HEAP_PLATEAU_TOLERANCE_BYTES
     else:
         plateau_spread = None
-        plateau_ok = True  # not enough tail to assert; bound still gates
+        plateau_ok = True
     released, final_stats = slots_released(cfg)
-    # A run that cannot be checked is a failure, not a pass.
     consistency = accounting_verdict(final_stats, open_at_reset)
     lwip_failures = lwip_alloc_failures(lwip_before, _safe_lwip(cfg))
     return {
@@ -994,14 +874,9 @@ def t7_soak(cfg):
 
 
 def t8_rst_robustness(cfg):
-    """RST/abort robustness (RR-1).
+    """Repeated resets of partial requests check slot reuse (RR-1).
 
-    Repeatedly opens a connection, sends a partial request (no terminating
-    CRLFCRLF), then hard-resets the socket via SO_LINGER(0) so the close()
-    sends a real RST instead of a clean FIN -- the path on which an incomplete
-    teardown leaks connection-tracking state, wedging the server once the PCB
-    pool fills with zombies. Afterwards asserts every application-level
-    connection slot is free and freshly serviceable.
+    SO_LINGER(0) sends RST on close.
     """
     n = cfg.count or 100
     max_conns = cfg.info.get("max_connections", cfg.info.get("memp_num_tcp_pcb", 3))
@@ -1011,14 +886,15 @@ def t8_rst_robustness(cfg):
     for _ in range(n):
         try:
             sock = connect_with_retry(cfg.host, cfg.port, cfg.timeout)
-            sock.sendall(b"GET /ping HTTP/1.1\r\nHost: x\r\n")  # no final CRLF
-            # SO_LINGER(1, 0): close() below sends RST instead of FIN+ACK.
+            sock.sendall(b"GET /ping HTTP/1.1\r\nHost: x\r\n")  # No final CRLF.
+            # SO_LINGER(1, 0) makes close() send RST.
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
                             struct.pack("ii", 1, 0))
             sock.close()
         except OSError:
             rst_failures += 1
-        time.sleep(0.02)  # let the device's RST handling run between shots
+        # The delay allows device reset handling between attempts.
+        time.sleep(0.02)
 
     if not settle(cfg, quiet_s=0.5, deadline_s=15):
         return {"n": n, "rst_failures": rst_failures,
@@ -1026,9 +902,7 @@ def t8_rst_robustness(cfg):
 
     mid_stats = _safe_stats(cfg) or {}
 
-    # The core assertion: every application connection slot must be usable
-    # immediately afterwards -- a wedged pool would start refusing or hanging
-    # on some of these.
+    # Every slot must be usable immediately after the resets.
     fresh_ok = 0
     fresh_conns = []
     try:
@@ -1043,16 +917,12 @@ def t8_rst_robustness(cfg):
             c.close()
 
     end_stats = _safe_stats(cfg) or {}
-    # RR-1 also requires the RST count to show up: every successful shot sent a
-    # partial request then a hard RST, which the device must classify as a peer
-    # reset. Allow slack only for the connects that failed outright (rst_failures)
-    # and rare timing where a shot is seen as a plain close.
+    # Each successful reset attempt must count as peer reset. Failed connects
+    # and rare plain closes allow slack (RR-1).
     reset_count = mid_stats.get("disconnect_peer_reset", 0)
     expected_resets = n - rst_failures
     resets_ok = reset_count >= expected_resets - 2
-    # active_connections is a live gauge sampled while /stats itself is being
-    # served, so the requesting connection always counts as active (the
-    # observer effect) -- 1 is the true "otherwise idle" baseline, not 0.
+    # The /stats connection contributes one to active_connections.
     return {
         "n": n,
         "rst_failures": rst_failures,
@@ -1069,11 +939,10 @@ def t8_rst_robustness(cfg):
 
 
 def t9_slowloris(cfg):
-    """Slowloris defense (TR-1).
+    """Check slowloris defence (TR-1).
 
-    Open a connection and drip request-head bytes far slower than the
-    header-completion timeout; the device must close it near TR-1 while a
-    separate client keeps being served throughout.
+    A dripped head must close near the header deadline while another client
+    remains served (TR-1).
     """
     limits = getattr(cfg, "limits", {}) or {}
     header_ms = limits.get("timeout_header_ms", 5000)
@@ -1081,13 +950,11 @@ def t9_slowloris(cfg):
 
     reset_stats(cfg.host, cfg.port, cfg.timeout)
     sock = connect_with_retry(cfg.host, cfg.port, cfg.timeout)
-    sock.sendall(b"GET / HTTP/1.1\r\n")  # start a head, then stall
+    sock.sendall(b"GET / HTTP/1.1\r\n")
     start = time.time()
 
     served_during = 0
     closed_at = None
-    # Drip one header byte every ~1 s (well under the 5 s window) and poll a
-    # second connection for liveness; expect closure at ~header_s.
     deadline = header_s + 4.0
     while time.time() - start < deadline:
         try:
@@ -1101,7 +968,6 @@ def t9_slowloris(cfg):
                 served_during += 1
         except (OSError, HttpError):
             pass
-        # Detect a server-side close: a recv returning empty.
         sock.settimeout(0.1)
         try:
             if sock.recv(64) == b"":
@@ -1129,10 +995,10 @@ def t9_slowloris(cfg):
 
 
 def t10_boundary_matrix(cfg):
-    """Boundary enforcement (BR-1..9, NR-1..6).
+    """Boundary checks cover malformed and oversized requests.
 
-    Each malformed or oversized request must yield the specified status with
-    Connection: close, never a hang or a silent truncation.
+    Each must return the specified status with Connection: close
+    (BR-1..9, NR-1..6).
     """
     limits = getattr(cfg, "limits", {}) or {}
     max_uri = limits.get("max_uri", 512)
@@ -1144,7 +1010,7 @@ def t10_boundary_matrix(cfg):
         try:
             conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
             conn.sock.sendall(raw)
-            resp = conn.read_response()  # parse whatever comes back
+            resp = conn.read_response()
             conn.close()
             ok = resp.status == expect_status
             cases.append({"case": name, "status": resp.status,
@@ -1156,51 +1022,44 @@ def t10_boundary_matrix(cfg):
                           "ok": False, "error": str(exc)})
 
     host = cfg.host.encode()
-    # 414: URI over the limit.
     long_uri = b"/" + b"a" * (max_uri + 50)
     check("414_long_uri",
           b"GET " + long_uri + b" HTTP/1.1\r\nHost: " + host + b"\r\n\r\n", 414)
-    # 431: too many headers.
     many = b"".join(b"H%d: v\r\n" % i for i in range(40))
     check("431_many_headers",
           b"GET / HTTP/1.1\r\nHost: " + host + b"\r\n" + many + b"\r\n", 431)
-    # 413: buffered body over the limit.
     big = b"x" * (max_body + 100)
     check("413_big_body",
           b"POST / HTTP/1.1\r\nHost: " + host +
           b"\r\nContent-Length: %d\r\n\r\n" % len(big) + big, 413)
-    # 505: well-formed but unsupported HTTP version (1.2 RFC audit, BR-11).
-    # HTTP/2.0 is HTTP/<DIGIT>.<DIGIT> so it parses; not 1.0/1.1 -> 505, not 400.
+    # A syntactically valid unsupported HTTP version returns 505 (BR-11).
     check("505_unsupported_version",
           b"GET / HTTP/2.0\r\nHost: " + host + b"\r\n\r\n", 505)
-    # 400: conflicting Content-Length (smuggling).
     check("400_dup_content_length",
           b"POST / HTTP/1.1\r\nHost: " + host +
           b"\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nx", 400)
-    # 501: unsupported Transfer-Encoding.
     check("501_te_gzip",
           b"POST / HTTP/1.1\r\nHost: " + host +
           b"\r\nTransfer-Encoding: gzip\r\n\r\n", 501)
-    # 501: stacked codings — only a lone "chunked" is supported (NR-4).
+    # Only a lone chunked coding is supported (NR-4).
     check("501_te_stacked",
           b"POST / HTTP/1.1\r\nHost: " + host +
           b"\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501)
-    # 400: Transfer-Encoding on an HTTP/1.0 message is faulty framing
-    # (RFC 9112 §6.1) — rejected, never decoded.
+    # HTTP/1.0 Transfer-Encoding is rejected as faulty framing (RFC 9112
+    # §6.1).
     check("400_te_http10",
           b"POST /upload HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n"
           b"3\r\nabc\r\n0\r\n\r\n", 400)
-    # 417: the only implemented expectation is 100-continue; others are
-    # refused, not silently ignored (RFC 9110 §10.1.1).
+    # Unimplemented expectations return 417 (RFC 9110 §10.1.1).
     check("417_unknown_expect",
           b"POST /upload HTTP/1.1\r\nHost: " + host +
           b"\r\nContent-Length: 2\r\nExpect: 200-maybe\r\n\r\nhi", 417)
-    # 200: one empty line before the request-line is ignored (RFC 9112 §2.2).
+    # One leading CRLF is ignored (RFC 9112 §2.2).
     check("200_leading_crlf",
           b"\r\nGET /ping HTTP/1.1\r\nHost: " + host +
           b"\r\nConnection: close\r\n\r\n", 200)
 
-    # --- HEAD (RFC 9110 §9.1): GET's header section, no body ---------------
+    # HEAD returns GET's header section without a body (RFC 9110 §9.3.2).
     try:
         conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
         conn.sock.sendall(b"HEAD /ping HTTP/1.1\r\nHost: " + host +
@@ -1219,31 +1078,23 @@ def t10_boundary_matrix(cfg):
         head_end = raw.find(b"\r\n\r\n")
         ok = (raw.startswith(b"HTTP/1.1 200") and head_end != -1 and
               b"Content-Length: 4\r\n" in raw and
-              raw[head_end + 4:] == b"")  # headers as GET, zero body bytes
+              raw[head_end + 4:] == b"")
         cases.append({"case": "head_of_get_no_body", "status": 200 if ok else None,
                       "expect": 200, "ok": ok})
     except (OSError, HttpError) as exc:
         cases.append({"case": "head_of_get_no_body", "status": None,
                       "expect": 200, "ok": False, "error": str(exc)})
 
-    # --- Chunked decode (NR-4) ---------------------------------------------
+    # Chunked request decoding (NR-4).
     def enc_chunks(chunks, ext=b"", trailer=b""):
-        """Frame a body per RFC 9112 chunked encoding.
-
-        Optional chunk extension on every size line, optional trailer section
-        after the last chunk.
-        """
+        """Frame chunks with optional extensions and trailers (RFC 9112 §7.1)."""
         out = b""
         for c in chunks:
             out += b"%x" % len(c) + ext + b"\r\n" + c + b"\r\n"
         return out + b"0" + ext + b"\r\n" + trailer + b"\r\n"
 
     def check_chunked_upload(name, chunks, ext=b"", trailer=b""):
-        """Check a chunked POST to /upload decodes to the concatenated data.
-
-        The route replies with the received length and byte checksum of the
-        body it saw, so framing bytes leaking through are caught.
-        """
+        """Check the decoded upload length and checksum for leaked framing bytes."""
         decoded = b"".join(chunks)
         raw = (b"POST /upload HTTP/1.1\r\nHost: " + host +
                b"\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
@@ -1264,21 +1115,17 @@ def t10_boundary_matrix(cfg):
             cases.append({"case": name, "status": None, "expect": 200,
                           "ok": False, "error": str(exc)})
 
-    # Decoded multi-chunk body, split so chunk sizes need multi-digit hex.
     check_chunked_upload("200_chunked_decoded",
                          [b"hello ", b"chunked ", b"x" * 300, b"world"])
-    # Chunk extensions ignored, trailer consumed and discarded.
     check_chunked_upload("200_chunked_ext_trailer",
                          [b"trailer", b"ed"],
                          ext=b";bench=1", trailer=b"X-Checksum: ignored\r\n")
-    # 413: chunked body over the buffered-body limit.
     check("413_chunked_oversize",
           b"POST /upload HTTP/1.1\r\nHost: " + host +
           b"\r\nTransfer-Encoding: chunked\r\n\r\n" +
           enc_chunks([b"x" * (max_body + 100)]), 413)
 
-    # --- Expect: 100-continue (NR-5) ---------------------------------------
-    # In-limit declared body: interim 100, body sent only after it, final 200.
+    # The interim 100 precedes the body and final response (NR-5).
     try:
         body = b"y" * 64
         conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
@@ -1300,7 +1147,6 @@ def t10_boundary_matrix(cfg):
     except (OSError, HttpError, ValueError) as exc:
         cases.append({"case": "100_continue_then_200", "status": None,
                       "expect": 200, "ok": False, "error": str(exc)})
-    # Oversized declared body: immediate 413 (no interim 100), body unsent.
     check("413_expect_oversize",
           b"POST /upload HTTP/1.1\r\nHost: " + host +
           b"\r\nContent-Length: %d" % (max_body + 100) +
@@ -1309,59 +1155,33 @@ def t10_boundary_matrix(cfg):
     passed = all(c["ok"] for c in cases)
     return {"cases": cases, "pass": passed}
 
-
-# A lost acknowledgement shows up as a multi-second gap between reads on one
-# connection while the others run normally, and the device then retransmits
-# from the first byte because nothing was ever acked. It is a property of the
-# link under a synchronised burst rather than of the service: staggering the
-# connection starts by 150 ms removes it entirely (0 of 5 runs, against 5 of 5
-# started together), and every device-side counter stays clean through it.
-# Against wall clock one such gap turns a ~930 KB/s set into ~190, so the
-# verdict is taken on the stall-free rate and the stall is reported beside it
-# rather than folded silently into the number.
+# The stall threshold separates receiving spans for the rate recorded beside
+# wall-clock throughput.
+# baselines/README.md explains send-gap interpretation.
 STALL_GAP_S = 0.5
 
 
 def t20_aggregate_download(cfg):
-    """Aggregate download across parallel connections (PR-6, PR-9).
+    """Parallel throughput and send gaps are review evidence (PR-6, PR-9).
 
-    PR-6 is about what the device sustains when several connections pull at
-    once, which is a different question from PR-5's single-connection figure:
-    the ring, the pbuf pool and the write scheduler are shared, so aggregate
-    throughput can be well below or well above the single-connection rate.
-    t11 was cited for this and opens one connection, so nothing measured it.
-    Any lwIP allocation the run had refused fails it too: a refused write
-    waits for the transport's poll, which reads as a stall.
+    The measurement differs from single-connection throughput (PR-5).
 
-    PR-6 throughput and PR-9 gaps are review evidence. Completion and refused
-    lwIP allocations retain their mechanised verdict.
+    Completion and lwIP allocation failures decide the verdict.
     """
     workers = cfg.info.get("max_connections", 8)
     lwip_before = _safe_lwip(cfg)
     size = cfg.body_bytes or 65536
     target_kbps = cfg.aggregate_kbps
-    # PR-9. Two initial RTOs: one retransmission is the cost of the ack loss the
-    # burst causes, and the second covers the backoff when the retransmission is
-    # lost too. Expressed against the device's configured RTO rather than as a
-    # wall-clock constant, because the absolute figure is the application's to
-    # set through lwipopts (AR-10) and the ceiling has to follow it.
-    #
-    # Plus one segment's delivery. The gap ends when the next byte *arrives*,
-    # so a genuine two-RTO event carries the retransmitted segment's own
-    # traversal on top of the timers -- which means a ceiling of exactly
-    # 2 x RTO cannot be met in the one case the two-RTO term exists to cover.
-    # The term is sized against the round-trip a connection sees while the
-    # cap is saturated, not the idle one, and it cannot be measured during the
-    # burst itself: every slot is in use, so a probe would be the refusal RR-3
-    # describes rather than a sample.
+    # The gap expectation follows the configured initial RTO plus delivery
+    # allowance (PR-9, AR-10). The allowance is a constant because a probe
+    # during full-slot load would be rejected (RR-3).
     rto_ms = cfg.info.get("tcp_rto_ms", 3000)
     gap_ceiling_s = 2.0 * rto_ms / 1000.0 + BURST_SEGMENT_DELIVERY_S
     results = [None] * workers
 
     def pull(index):
-        # A raw socket, not HttpConn: the gap between successive reads is the
-        # measurement, and it is not observable through a call that returns
-        # only once the whole body has arrived.
+        # A raw socket exposes gaps between reads that HttpConn hides until
+        # body completion.
         started = time.monotonic()
         try:
             sock = connect_with_retry(cfg.host, cfg.port, cfg.timeout)
@@ -1372,7 +1192,8 @@ def t20_aggregate_download(cfg):
                 f"GET /payload/{size} HTTP/1.1\r\nHost: bench\r\n"
                 f"Connection: close\r\n\r\n".encode())
             buf, last, worst = b"", started, 0.0
-            active = []  # [start, end] spans this connection was receiving in
+            # The intervals when this connection was receiving are in seconds.
+            active = []
             span_start = started
             while True:
                 chunk = sock.recv(65536)
@@ -1382,8 +1203,6 @@ def t20_aggregate_download(cfg):
                 gap = now - last
                 worst = max(worst, gap)
                 if gap > STALL_GAP_S:
-                    # The span ended when the last byte landed; the gap itself
-                    # is time this connection contributed nothing.
                     active.append([span_start, last])
                     span_start = now
                 last = now
@@ -1416,18 +1235,9 @@ def t20_aggregate_download(cfg):
     worst_gap = max((r["worst_gap"] for r in results if r), default=0.0)
     stalled = sum(1 for r in results if r and r["worst_gap"] > STALL_GAP_S)
 
-    # Wall clock across the whole set, not the sum of per-connection rates:
-    # the aggregate is what the device delivered while all of them were live.
     kbps = (total_bytes / 1024.0) / wall if wall > 0 else 0.0
-    # The same bytes over the time the device was actually delivering to
-    # somebody: the union of the connections' receiving spans. The union is
-    # what makes this robust to how many connections stalled at once — taking
-    # any single connection's active time credits the set with time it spent
-    # serving the others, and read several times the radio's ceiling when four
-    # of eight stalled. With nothing stalled the two figures converge as the
-    # transfer grows against the fixed per-connection setup and teardown the
-    # spans do not cover: measured 707-853 KB/s against a 196-226 wall-clock
-    # figure at 64 KB with stalls, and 549 against 452 at 2 KB with none.
+    # The union of receiving spans avoids crediting one connection with time
+    # spent serving another.
     spans = sorted(sp for r in complete for sp in r["active"] if sp[1] > sp[0])
     union, end = 0.0, None
     for lo, hi in spans:
@@ -1460,14 +1270,12 @@ def t20_aggregate_download(cfg):
 
 
 def t11_backpressure_download(cfg):
-    """No response-size ceiling (PR-8, AR-5).
+    """Verify a bit-exact 256 KB body across ring fills (PR-8, AR-5).
 
-    Pull a 256 KB generator body and verify it arrives bit-exact; the writer
-    must resume across many ring fills.
+    The writer must resume across many ring fills.
     """
-    # Not --count: this is a byte size, and sharing the request-count flag let
-    # `--count 50` turn a 256 KB backpressure test into a single-segment
-    # request that fills no ring and still reported pass.
+    # A byte size, not --count: a request count here shrank the body below
+    # one ring fill.
     size = cfg.body_bytes or 262144
     conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
     try:
@@ -1477,8 +1285,7 @@ def t11_backpressure_download(cfg):
     expected = expected_pattern(size)
     stats = _safe_stats(cfg) or {}
     events = stats.get("backpressure_events")
-    # The writer must actually have had to resume: a body that fits the ring
-    # proves nothing about PR-8 or AR-5 however faithfully it arrives.
+    # The writer must resume at least once to exercise streaming (PR-8, AR-5).
     resumed = events is None or events > 0
     ok = resp.status == 200 and resp.body == expected and resumed
     return {
@@ -1493,20 +1300,11 @@ def t11_backpressure_download(cfg):
 
 
 def t12_slow_reader(cfg):
-    """Slow/stalled reader isolation (TR-4, AR-5).
+    """Parallel clients remain served beside a stalled download.
 
-    A client that opens a large download and then stops reading must not
-    degrade service for other clients, and must be reclaimed by the write-stall
-    timeout (TR-4) rather than pinning its slot forever. Open a 256 KB download
-    on a small-rcvbuf socket, read a little, then stall; poll a separate /ping
-    connection throughout (isolation) and confirm the server closes the stalled
-    one via TR-4.
-
-    The authoritative TR-4 signal is the disconnect_timeout_write counter, not
-    the client-observed close time: once the client stops reading, its kernel
-    receive buffer fills and no further ACK reaches the server, so timing the
-    close from the client is unreliable (any recv() would reopen the window and
-    reset the deadline). We measure the counter instead.
+    A stalled download must not degrade other clients and must be reclaimed
+    by the write timeout (TR-4, AR-5). The disconnect counter avoids client
+    buffering and reads that reopen the window.
     """
     limits = getattr(cfg, "limits", {}) or {}
     write_ms = limits.get("timeout_write_ms", 10000)
@@ -1514,8 +1312,8 @@ def t12_slow_reader(cfg):
 
     reset_stats(cfg.host, cfg.port, cfg.timeout)
     sock = connect_with_retry(cfg.host, cfg.port, cfg.timeout + write_s)
-    # A small receive buffer makes the window close soon after we stop reading,
-    # so the server blocks with a full TX ring and TR-4 fires cleanly.
+    # A small receive window makes the server stall before its write timeout
+    # (TR-4).
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
     sock.sendall(b"GET /payload/262144 HTTP/1.1\r\nHost: " + cfg.host.encode() +
                  b"\r\nConnection: keep-alive\r\n\r\n")
@@ -1529,12 +1327,11 @@ def t12_slow_reader(cfg):
             primed += chunk
     except TimeoutError:
         pass
-    # Stall: stop reading `sock` entirely from here on.
 
     stall_start = time.time()
     probe_ms = []
     probe_failures = 0
-    # Keep a second client busy while the first is stalled; it must stay served.
+    # A second client must remain served while the first is stalled.
     while time.time() - stall_start < write_s + 3.0:
         t0 = time.perf_counter()
         try:
@@ -1566,16 +1363,13 @@ def t12_slow_reader(cfg):
 
 
 def t13_rx_flow_control(cfg):
-    """RX flow control under backpressure (AR-6, OR-1).
+    """Pipelined requests wait behind a draining response.
 
-    When a response is draining under backpressure, the server holds the
-    receive window closed against further inbound bytes rather than dropping
-    them. Pipeline a
-    large (backpressured) download immediately followed by a second request on
-    one connection: the second request's bytes must sit in the RX assembly
-    buffer with the window held closed while the first response streams out
-    (rx_window_throttle_events > 0), and both responses must arrive uncorrupted
-    — a full RX buffer must hold the window closed, never silently truncate.
+    Their bytes must remain buffered with the window closed while that
+    response drains (AR-6, OR-1).
+
+    Both responses must arrive uncorrupted; a full RX buffer must hold the
+    window closed without truncation.
     """
     size = cfg.body_bytes or 65536
     reset_stats(cfg.host, cfg.port, cfg.timeout)
@@ -1588,8 +1382,6 @@ def t13_rx_flow_control(cfg):
     conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
     try:
         conn.sock.sendall(pipelined)
-        # Read the first (large) response slowly so it stays backpressured while
-        # the second request waits in the RX buffer, then read the second.
         first = _read_response_paced(conn, pace_s=0.02)
         second = conn.read_response(keep_alive=False)
     finally:
@@ -1600,9 +1392,8 @@ def t13_rx_flow_control(cfg):
     second_ok = second.status == 200 and second.body == b"pong"
     stats = _safe_stats(cfg) or {}
     throttles = stats.get("rx_window_throttle_events", 0)
-    # Holding the window closed is the intended behaviour; discarding delivered
-    # bytes because they did not fit the assembly buffer is the failure. They
-    # are separate counters, so this run tells them apart.
+    # Separate counters distinguish receive-window throttling from discarded
+    # bytes.
     drops = stats.get("rx_overflow_drops", 0)
     return {
         "size": size,
@@ -1617,12 +1408,7 @@ def t13_rx_flow_control(cfg):
 
 
 def _read_response_paced(conn, pace_s=0.02):
-    """Read a response, sleeping between recv()s.
-
-    Like HttpConn.read_response, but the pacing keeps a large response under
-    backpressure on the device side (used by t13 to keep the receive window
-    closed while a pipelined request waits).
-    """
+    """Read a response with paced recv() calls to hold backpressure during t13."""
     start = time.perf_counter()
     if not conn.recv_until(b"\r\n\r\n"):
         conn.closed = True
@@ -1668,12 +1454,10 @@ def t14_timeout_precision(cfg):
     response has drained, and the client's clock starts when that response
     arrives -- one leg later. The close then takes a leg to come back, so in the
     steady state the two cancel and the reading is the timeout plus the scan
-    interval. What breaks the cancellation is asymmetry: a response leg delayed
-    by a retransmission against a clean close leg reads *short* by the
-    difference, and the device cannot close early, so a reading below the
-    configured value is that asymmetry and nothing else. Adding back half a
-    round-trip recovers the delayed case and costs a few milliseconds when the
-    link is quiet.
+    interval. A delayed response leg, or client delay before its clock starts,
+    reads short, because the device does not close before its deadline. Adding
+    half the request's round-trip is a heuristic correction for that shortfall;
+    with symmetric legs the reading is then half a round-trip long.
 
     Header: the device arms when the partial head arrives, a leg after the
     client starts its clock, and the close takes another leg to come back. Both
@@ -1698,7 +1482,7 @@ def t14_timeout_precision(cfg):
     def measure_idle():
         conn = HttpConn(cfg.host, cfg.port, cfg.timeout + idle_ms / 1000.0)
         sent = time.monotonic()
-        conn.request("GET", "/ping", keep_alive=True)  # then go quiet
+        conn.request("GET", "/ping", keep_alive=True)
         start = time.monotonic()
         rtt = start - sent
         wait_for_close(conn.sock, idle_ms / 1000.0 + 5.0)
@@ -1707,8 +1491,8 @@ def t14_timeout_precision(cfg):
         return elapsed, rtt
 
     def measure_header():
-        # The correction term is taken on its own connection, immediately
-        # before, because the measured one never completes a request.
+        # A separate probe measures RTT because the timed connection never
+        # completes a request.
         probe = HttpConn(cfg.host, cfg.port, cfg.timeout)
         sent = time.monotonic()
         probe.request("GET", "/ping")
@@ -1717,7 +1501,7 @@ def t14_timeout_precision(cfg):
 
         sock = connect_with_retry(cfg.host, cfg.port,
                                   cfg.timeout + header_ms / 1000.0)
-        sock.sendall(b"GET / HTTP/1.1\r\n")  # partial head, then stall
+        sock.sendall(b"GET / HTTP/1.1\r\n")
         start = time.monotonic()
         wait_for_close(sock, header_ms / 1000.0 + 5.0)
         elapsed = time.monotonic() - start
@@ -1762,17 +1546,10 @@ def t14_timeout_precision(cfg):
 
 
 def t15_footprint(cfg):
-    """Static-footprint runtime half (AR-1).
-
-    After a burst of keep-alive requests on a single long-lived connection, the
-    post-init heap-growth proxy must stay at zero — the static and generator
-    response paths allocate nothing.
-    """
-    reset_stats(cfg.host, cfg.port, cfg.timeout)  # re-baselines the tracker
+    """Post-init heap growth must stay zero on static/generator paths (AR-1)."""
+    reset_stats(cfg.host, cfg.port, cfg.timeout)
 
     def burst(path, count):
-        # Keep-alive requests, reconnecting when the server hits its per-
-        # connection request cap (it sends Connection: close and closes).
         conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
         try:
             for _ in range(count):
@@ -1783,8 +1560,6 @@ def t15_footprint(cfg):
             conn.close()
 
     burst("/ping", 200)
-    # Progressively larger generator bodies: the path that would expose a
-    # growing per-connection buffer if one existed.
     for size in (1024, 8192, 65536, 262144):
         burst(f"/payload/{size}", 5)
     stats = _safe_stats(cfg) or {}
@@ -1796,14 +1571,7 @@ def t15_footprint(cfg):
 
 
 def t16_chunked_download(cfg):
-    """Chunked response encoding (NR-6).
-
-    GET /stream/<size> returns the same pattern as /payload but framed with
-    Transfer-Encoding: chunked and no Content-Length. Verify the header,
-    bit-exact decoded body across sizes (including one that streams over many
-    ring fills), and that keep-alive survives a chunked response
-    (self-delimiting).
-    """
+    """Chunked output preserves integrity and connection reuse across sizes (NR-6)."""
     sizes = cfg.sizes or [1024, 65536, 262144]
     per_size = []
     all_ok = True
@@ -1829,7 +1597,7 @@ def t16_chunked_download(cfg):
             "pass": bool(ok),
         })
 
-    # Keep-alive must survive a chunked response (it is self-delimiting).
+    # Keep-alive must survive the self-delimiting chunked response.
     keep_alive_ok = False
     conn = HttpConn(cfg.host, cfg.port, cfg.timeout)
     try:
@@ -1850,12 +1618,9 @@ def t16_chunked_download(cfg):
 
 
 def _body_mode_run(cfg, prefix, size, n):
-    """Drive n keep-alive GETs of prefix+size.
+    """Return latency, throughput and integrity results for repeated GETs.
 
-    Returns latency samples, throughput samples, and correctness flags. A 413
-    on the first request means the body exceeds the server's max_buffered_body
-    (buffered mode only): the caller treats that size as skipped rather than
-    failed.
+    A first-response 413 skips an oversized buffered body.
     """
     expected = expected_pattern(size)
     max_per_conn = max(1, cfg.info.get("keep_alive_max_requests", 16) - 1)
@@ -1904,16 +1669,9 @@ def _body_mode_run(cfg, prefix, size, n):
 
 
 def t17_body_mode_comparison(cfg):
-    """Compare BUFFERED against STATIC_VIEW for an identical body.
+    """Compare latency and throughput for identical static and copied bodies.
 
-    /bench/static/<n> serves n bytes via STATIC_VIEW (copied only into the ring);
-    /bench/buffered/<n> serves the same bytes via BUFFERED (the per-slot
-    body copy before the ring). For each size, drive N keep-alive requests per
-    mode and report per-request latency percentiles, mean throughput, and the
-    buffered-vs-static throughput deficit, so the double-copy cost can be judged
-    against the recorded history at review. Buffered bodies above the server's
-    max_buffered_body return 413 and are recorded as skipped: run --sizes 8192
-    on the p8-rp2350 profile; the default profile caps buffered bodies at 2048.
+    Above-cap buffered bodies return 413 and are skipped.
     """
     sizes = cfg.sizes or [2048]
     n = cfg.count or 100
@@ -1945,12 +1703,10 @@ def t17_body_mode_comparison(cfg):
 
 
 def _ping_under_load(cfg, heavy_path, burn_ms, n_ping, n_heavy):
-    """Measure /ping latency while a CPU-heavy route is being hammered.
+    """Measure ping latency under heavy-route load.
 
-    One thread keeps `n_heavy` requests going against heavy_path; the main
-    thread samples /ping on its own keep-alive connection. Returns the /ping
-    percentiles plus the heavy route's own latency, so a run that failed to
-    generate load is distinguishable from one where load simply did not hurt.
+    Heavy-route latency distinguishes failed load generation from load that
+    leaves ping unaffected.
     """
     stop = threading.Event()
     heavy_samples = []
@@ -1980,7 +1736,7 @@ def _ping_under_load(cfg, heavy_path, burn_ms, n_ping, n_heavy):
 
     worker = threading.Thread(target=hammer, daemon=True)
     worker.start()
-    time.sleep(0.2)  # let the load actually start before sampling
+    time.sleep(0.2)  # Load starts before ping sampling.
 
     ping_samples = []
     conn = None
@@ -2012,11 +1768,9 @@ def _ping_under_load(cfg, heavy_path, burn_ms, n_ping, n_heavy):
 
 
 def t19_deferred_handler(cfg):
-    """AR-9: verify deferred dispatch and pool accounting under load.
+    """Check deferred dispatch, work and pool accounting (AR-9).
 
-    Synchronous/deferred ping latency and improvement are review evidence.
-    Dispatch coverage, positive work, errors, timeouts and stranded entries
-    retain their mechanised verdict.
+    Latency and improvement are review evidence.
     """
     burn = cfg.burn_ms or 10
     n_ping = cfg.count or 100
@@ -2031,7 +1785,6 @@ def t19_deferred_handler(cfg):
     stats = get_stats(cfg.host, cfg.port, cfg.timeout)
     settle(cfg)
 
-    # percentiles() names its keys with the unit suffix.
     sync_p99 = sync["ping"].get("p99_ms")
     def_p99 = deferred["ping"].get("p99_ms")
     pr1_p99_ceiling = 40.0
@@ -2040,15 +1793,8 @@ def t19_deferred_handler(cfg):
     if sync_p99 and def_p99:
         improvement = round((sync_p99 - def_p99) / sync_p99 * 100.0, 1)
 
-    # The deferred run must actually have deferred, or the comparison is
-    # between two identical synchronous paths and proves nothing.
-    # Offered load, which the comparison assumes is equal and did not check.
-    # The hammer thread is serial and runs until the ping loop finishes, so an
-    # arm whose per-request latency is higher delivers proportionally fewer
-    # heavy requests -- and a device under lighter load answers /ping faster
-    # for a reason that is not deferral. Before the firmware's poll period was
-    # cut this ran at roughly a quarter of the synchronous arm's load, and the
-    # improvement figure absorbed the difference.
+    # The deferred run must defer. Offered-load ratios expose serial workers
+    # doing less heavy work when their requests take longer.
     sync_heavy = sync["heavy_requests"]
     def_heavy = deferred["heavy_requests"]
     load_ratio = round(def_heavy / sync_heavy, 3) if sync_heavy else 0.0
@@ -2057,10 +1803,7 @@ def t19_deferred_handler(cfg):
     dispatched = stats.get("pending_dispatches", 0)
     exhausted = stats.get("deferrals_refused", 0)
     handler_timeouts = stats.get("disconnect_timeout_handler", 0)
-    # Every request claims a pool entry for the duration of its dispatch, so the
-    # /stats request reading this counter is itself holding one. The floor
-    # sampled from inside a handler is 1, not 0; anything above that is an entry
-    # a finished request failed to release (BR-12).
+    # pending_responses counts parked deferrals; one is tolerated (BR-12).
     held = stats.get("pending_responses", 0)
     stranded = max(0, held - 1)
 
@@ -2091,38 +1834,22 @@ def t19_deferred_handler(cfg):
 
 
 def t18_heap_mechanism(cfg):
-    """Assert the proven copied-body heap model (spec AR-1) from a clean reboot.
+    """Check idle heap after static, generated and copied-body workloads (AR-1).
 
-    Verifies, as pass/fail gates:
-      - static/generator paths allocate ~zero over thousands of requests,
-      - copied bodies served on every slot at once, then repeated and at a
-        smaller size on one connection, leave ~zero behind once the slots are
-        idle: each slot frees its copied body when the response is sent.
-
-    It samples only idle slots, so it does not observe the in-flight bound,
-    max_connections * max_buffered_body: that rests on set_body's refusal
-    (BR-14) and on the slot trimming spare capacity, which the host suite
-    tests.
-
-    Opt-in (not in the default set) because it is long and heap-heavy.
-
-    It does not reboot the device, and does not need to: it establishes its own
-    starting point with the explicit warm and reset_stats below, which supersede
-    any clean-heap premise. The firmware serves no reset route, so there is
-    nothing to request and no device-came-back guard that could fire.
+    Warm-up and reset establish the baseline without rebooting. Host tests
+    check the in-flight bound and oversized rejection (BR-14).
     """
     maxc = cfg.info.get("max_connections",
                         cfg.info.get("memp_num_tcp_pcb", 8))
     max_body = cfg.limits.get("max_buffered_body", 2048)
     bound = maxc * max_body
-    probe = min(max_body, 8192)  # copied body to exercise (<= cap and route max)
-    eps = 64  # one malloc bucket's worth; measured control noise was 24 B
+    probe = min(max_body, 8192)
+    # Control and idle copied-body checks treat growth up to this many bytes as
+    # zero.
+    eps = 64
 
     def occupy(path, k):
-        """Hold k concurrent keep-alive connections, one GET each.
-
-        k distinct connection slots are in use at once; then release.
-        """
+        """Hold k distinct connection slots for one request each, then release them."""
         conns = []
         try:
             conns.extend(HttpConn(cfg.host, cfg.port, cfg.timeout)
@@ -2146,24 +1873,21 @@ def t18_heap_mechanism(cfg):
     def growth():
         return (_safe_stats(cfg) or {}).get("post_init_heap_growth_bytes")
 
-    # Warm /stats on all slots, then re-baseline, so allocations the first
-    # requests make once (lwIP's and the measuring /stats reads') are excluded.
+    # Warming /stats on every slot excludes first-use allocations before
+    # rebaselining.
     occupy("/stats", maxc)
     reset_stats(cfg.host, cfg.port, cfg.timeout)
 
-    # (A) Negative control: static + generator paths add ~zero.
     hammer("/ping", 1500)
     hammer(f"/payload/{probe}", 1500)
     hammer(f"/bench/static/{probe}", 1500)
     g_control = growth()
 
-    # (B) Positive + saturation: one copied body across all slots, repeated.
     sat = []
     for _ in range(4):
         occupy(f"/bench/buffered/{probe}", maxc)
         sat.append(growth())
 
-    # (C) The same size repeated, then a smaller one: neither leaves anything.
     hammer(f"/bench/buffered/{probe}", 1500)
     g_reuse = growth()
     smaller = max(64, probe // 8)
@@ -2193,19 +1917,13 @@ def t18_heap_mechanism(cfg):
 
 
 def _recover(cfg):
-    """Best-effort ping to confirm the device is responsive again."""
+    """Ping checks device responsiveness."""
     with contextlib.suppress(OSError, HttpError):
         one_shot(cfg.host, cfg.port, cfg.timeout, "GET", "/ping")
 
 
 def settle(cfg, quiet_s=1.5, deadline_s=30):
-    """Wait until the device's TCP PCB pool has drained enough to answer a ping.
-
-    Then pause quiet_s so the next test starts from a clean pool. The device
-    only has MEMP_NUM_TCP_PCB (~3) PCBs, and Connection: close leaves each in
-    TIME_WAIT on the device side, so churn-heavy tests need the pool to recover
-    between them.
-    """
+    """Wait for ping, then pause quiet_s for lingering PCBs to clear."""
     start = time.time()
     while time.time() - start < deadline_s:
         try:
@@ -2218,24 +1936,19 @@ def settle(cfg, quiet_s=1.5, deadline_s=30):
         time.sleep(1.0)
     return False
 
-
-# Every disconnect reason the counter set names; their sum plus the connections
-# still open is every connection accepted (RR-4).
+# Disconnect counts plus live connections account for all accepts (RR-4).
 DISCONNECT_REASONS = ("disconnect_peer_closed", "disconnect_peer_reset",
                       "disconnect_aborted", "disconnect_timeout",
                       "disconnect_server_closed")
 TIMEOUT_KINDS = ("header", "body", "idle", "write", "drain", "handler")
 PARSE_ERROR_CLASSES = (400, 413, 414, 417, 431, 501, 505)
-SLOT_RELEASE_DEADLINE_S = 20  # past the 15 s idle timeout of a stray keep-alive
+# The deadline is in seconds and exceeds the 15 s idle timeout.
+# A stray keep-alive connection expires within it.
+SLOT_RELEASE_DEADLINE_S = 20
 
 
 def counters_consistent(stats, open_at_reset):
-    """RR-4: the counter set accounts for every connection since the reset.
-
-    Each connection accepted since the reset, and each open at it, is either
-    open now or ended with exactly one reason; the timeout total is the sum of
-    its kinds, and parse_errors the sum of its classes.
-    """
+    """Counter totals account for accepted and initially open connections (RR-4)."""
     closed = sum(stats.get(k, 0) for k in DISCONNECT_REASONS)
     timeouts = sum(stats.get(f"disconnect_timeout_{k}", 0) for k in TIMEOUT_KINDS)
     parse = sum(stats.get(f"parse_errors_{c}", 0) for c in PARSE_ERROR_CLASSES)
@@ -2251,7 +1964,7 @@ def counters_consistent(stats, open_at_reset):
 
 
 def accounting_verdict(final_stats, open_at_reset):
-    """counters_consistent, or a fail naming what made it uncheckable."""
+    """Unreadable counters fail the accounting check."""
     if final_stats is None:
         return {"ok": False, "reason": "no /stats reading after the run"}
     if open_at_reset is None:
@@ -2260,10 +1973,9 @@ def accounting_verdict(final_stats, open_at_reset):
 
 
 def slots_released(cfg, deadline_s=SLOT_RELEASE_DEADLINE_S):
-    """RR-4: wait for every slot but the measuring one to come free.
+    """Return the last stats and whether only the measuring connection remains.
 
-    Returns (released, stats): released when /stats reports one live
-    connection, its own, before the deadline; stats is the last reading.
+    The deadline bounds the wait for released slots (RR-4).
     """
     start = time.time()
     stats = None
@@ -2281,32 +1993,27 @@ def _safe_stats(cfg):
     except (OSError, HttpError, ValueError):
         return None
 
-
-# RR-2: the abuse run's size, and the deadline a fresh client's /ping must meet
-# once it ends. Slowloris heads are held a few at a time, below the slot count,
-# so the run measures recovery rather than its own refusals.
+# These set the abuse-run size, recovery deadline in seconds and number of
+# held slowloris heads.
+# Holding fewer heads than slots measures recovery rather than refusals (RR-2).
 ABUSE_EVENTS = 1000
 ABUSE_RECOVERY_S = 1.0
 ABUSE_SLOWLORIS_HELD = 2
 
 
 def _rst(sock):
-    """Close with an RST rather than a FIN (SO_LINGER 0)."""
+    """Close with RST using SO_LINGER(0)."""
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
     sock.close()
 
 
 def t21_abuse(cfg):
-    """Mixed abuse, then recovery (RR-2) and accounting (RR-4).
+    """Mixed abuse checks recovery (RR-2) and accounting (RR-4).
 
-    Rotates ABUSE_EVENTS events through four kinds: a peer RST mid-request, a
-    malformed request line (400), a header line over the cap (431), and a
-    slowloris head. Then ABUSE_SLOWLORIS_HELD fresh slowloris heads are opened
-    and left: a fresh client must get /ping within ABUSE_RECOVERY_S while they
-    hold their slots, and the device must reclaim them through the header
-    timeout (TR-1). Every slot must then come free, the heap must stay inside
-    AR-1's bound, and the counter set must account for every connection since
-    the reset. The event count is fixed, so --count does not shrink the run.
+    A fresh client must receive ping within ABUSE_RECOVERY_S while slowloris
+    heads remain. The device must reclaim them at header timeout (TR-1). Every
+    slot must then be released, heap must stay bounded (AR-1), and counters
+    must account for all connections. --count cannot reduce the event count.
     """
     n = ABUSE_EVENTS
     limits = getattr(cfg, "limits", {}) or {}
@@ -2353,8 +2060,8 @@ def t21_abuse(cfg):
             _rst(sock)
     duration_s = time.time() - started
 
-    # Slowloris heads left to the device, holding their slots through the
-    # recovery check below until the header timeout reclaims them.
+    # Held slowloris heads remain during the recovery check until their header
+    # timeout.
     lingering = []
     for _ in range(ABUSE_SLOWLORIS_HELD):
         try:
@@ -2364,7 +2071,7 @@ def t21_abuse(cfg):
         except OSError:
             failures += 1
 
-    # RR-2: a fresh client, timed from connect to the full response.
+    # Recovery time includes connect and the full ping response (RR-2).
     t0 = time.time()
     try:
         resp = one_shot(cfg.host, cfg.port, cfg.timeout, "GET", "/ping")
@@ -2406,44 +2113,31 @@ def t21_abuse(cfg):
                      reclaimed and heap_ok and released and consistency["ok"]),
     }
 
-
-# RR-6: requests pipelined behind each held download, more bytes than any
-# profile's receive window (5,840 B on P8-RP2350), so every slot's window is
-# full and held closed while its response is backpressured.
+# The pipeline exceeds either profile receive window, including 5840 B on
+# P8-RP2350 (RR-6).
 POOL_PIPELINED_BYTES = 8192
 POOL_DOWNLOAD_BYTES = 65536
 POOL_HOLD_S = 1.0
-POOL_PAD_VALUE = 200  # under the default MAX_HEADER_VALUE of 256
+# The padding is in bytes, under the default 256 B header-value cap.
+POOL_PAD_VALUE = 200
 
 
 def t22_pool_pressure(cfg):
-    """Every slot held at once against the pbuf pool (RR-6).
+    """Parallel full-window downloads test pooled receive storage (RR-6).
 
-    Each of max_connections connections asks for a large download and pipelines
-    POOL_PIPELINED_BYTES of header-padded /ping requests behind it, as many as
-    keep_alive_max_requests leaves room for, then reads nothing for
-    POOL_HOLD_S: every response is backpressured and every receive window full
-    and held closed at the same time, which is as hard as the configuration
-    lets the pool be pressed (the lwipopts assertions make the pool back
-    max_connections windows). Then each connection is read out. Passes when
-    every response is bit-exact and complete, at least one throttle per slot
-    was counted, no delivered byte was discarded, lwIP refused no allocation,
-    and the device still serves. Reports the
-    pool's high-water mark since boot (lwIP's, not reset by /stats/reset) and
-    the allocation failures during the run.
+    Pool peaks are measured since boot.
     """
     maxc = cfg.info.get("max_connections", 8)
-    size = POOL_DOWNLOAD_BYTES  # fixed: RR-6's row names it
+    # The fixed size exercises the receive-pool requirement (RR-6).
+    size = POOL_DOWNLOAD_BYTES
     host = cfg.host.encode()
-    # The download and the pings share one connection's request budget, so the
-    # pings are padded with headers until they carry POOL_PIPELINED_BYTES.
     max_per_conn = max(2, cfg.info.get("keep_alive_max_requests", 16) - 1)
     pings = max_per_conn - 1
     bare = b"GET /ping HTTP/1.1\r\nHost: %s\r\n\r\n" % host
     pad_lines = []
     pad = max(0, -(-POOL_PIPELINED_BYTES // pings) - len(bare))
     while pad > 0:
-        # Distinct names: repeated ones combine into one value (NR-10).
+        # Distinct names avoid repeated-field combination (NR-10).
         name = b"X-Pad-%d: " % len(pad_lines)
         value = b"p" * max(1, min(POOL_PAD_VALUE, pad - len(name) - 2))
         line = name + value + b"\r\n"
@@ -2499,8 +2193,8 @@ def t22_pool_pressure(cfg):
         "pbuf_pool_errors": pool_errors,
         "lwip_alloc_failures": lwip_failures,
         "responsive": responsive,
-        # A throttle per held slot, at least: /stats sees the count, not which
-        # windows were held.
+        # The count shows at least one throttle per held slot, without
+        # identifying windows.
         "pass": bool(not errors and drops == 0 and throttles >= maxc and
                      responsive and lwip_alloc_clean(lwip_failures)),
     }
@@ -2512,23 +2206,18 @@ def _safe_lwip(cfg):
     except (OSError, HttpError, ValueError):
         return {}
 
-
-# lwIP's refused allocations, by /lwip_stats key: the heap and the pools a send
-# draws from. A refusal does not fail a request -- tcp_write returns ERR_MEM and
-# the transport retries on the next poll -- so it shows only as a stall unless a
-# test asks. tcp.memerr is not among them: lwIP also counts a write refused for
-# a full send queue there, which is flow control rather than a shortage, so it
-# is recorded beside the verdict instead.
+# Allocation failures are counted separately from tcp.memerr, which also
+# includes full send queues. The transport retries ERR_MEM writes on poll, so
+# requests alone cannot expose allocation failure.
 LWIP_ALLOC_FAILURES = (("mem", "err"), ("pbuf_pool", "err"),
                        ("pbuf_ref", "err"), ("tcp_seg", "err"))
 LWIP_RECORDED = (("tcp", "memerr"),)
 
 
 def lwip_alloc_failures(before, after):
-    """Return each lwIP allocation-failure count's growth, or None if unread.
+    """Return allocation-failure deltas, or None if unread.
 
-    None is a failure to the caller: a run whose stack was not read cannot
-    show that nothing was refused.
+    Missing counters fail the caller.
     """
     deltas = {}
     for group, key in LWIP_ALLOC_FAILURES + LWIP_RECORDED:
@@ -2540,15 +2229,11 @@ def lwip_alloc_failures(before, after):
 
 
 def lwip_alloc_clean(failures):
-    """Return whether a lwip_alloc_failures() result shows no refusal.
-
-    The LWIP_RECORDED counts are reported, not judged.
-    """
+    """Check allocation-failure deltas. LWIP_RECORDED counts are reported for review."""
     if failures is None:
         return False
     return not any(failures[f"{group}.{key}"]
                    for group, key in LWIP_ALLOC_FAILURES)
-
 
 TESTS = {
     "t1": ("Latency (keep-alive GET /ping)", t1_latency),
@@ -2583,9 +2268,6 @@ TESTS = {
 }
 
 
-# --------------------------------------------------------------------------
-# Orchestration
-# --------------------------------------------------------------------------
 class Config:
     pass
 
@@ -2656,9 +2338,9 @@ def print_table(results):
                       "(samples={lock_hold_samples}) pass={ar3_pass}".format(
                           **data))
             else:
-                # Deliberately carries no pass field: a release build compiles
-                # the sampler out, so there is no verdict to report and the
-                # overall pass below covers workload correctness and RR-3.
+                # Release builds have no sampler verdict. The overall result
+                # still checks workload correctness and extra-connection
+                # rejection (RR-3).
                 print("  AR-3 lock hold: not measured (release build; "
                       "debug-only instrumentation)")
             print("  pass={pass}".format(**data))
@@ -2813,7 +2495,7 @@ def print_table(results):
 
 
 def rf_health(cfg):
-    """PR-1: fifteen keep-alive pings bracket a sweep as review evidence."""
+    """Fifteen keep-alive pings bracket the sweep as review evidence (PR-1)."""
     samples = []
     errors = 0
     conn = None
@@ -2836,7 +2518,7 @@ def rf_health(cfg):
 
 
 def history_comparison(results, info):
-    """PR-1/PR-9: record numeric comparisons without a performance verdict."""
+    """Record numeric comparisons without a performance verdict (PR-1/PR-9)."""
     profile = info.get("profile", "default")
     suffix = "-debug-t5" if info.get("build_type") == "Debug" else ""
     filename = "pico2w-" + profile.replace("-", "") + suffix + ".json"
@@ -2942,7 +2624,7 @@ def main(argv=None):
     print("Device info:")
     print(json.dumps(cfg.info, indent=2))
 
-    # Configured limits/timeouts drive the boundary and timeout tests (OR-3).
+    # Device-reported limits drive boundary and timeout tests (OR-3).
     try:
         cfg.limits = get_json(cfg.host, cfg.port, cfg.timeout, "/limits")
     except (OSError, HttpError, ValueError):
@@ -2950,7 +2632,6 @@ def main(argv=None):
 
     selected = [t.strip() for t in args.tests.split(",") if t.strip()]
 
-    # Warm-up (discarded).
     for _ in range(5):
         _recover(cfg)
 
@@ -2962,13 +2643,13 @@ def main(argv=None):
             continue
         title, func = TESTS[key]
         print(f"\n>>> Running [{key}] {title} ...")
-        # Start each test from a drained PCB pool so a churn-heavy predecessor
-        # doesn't bleed transient RSTs into the next test's numbers.
+        # A drained PCB pool prevents preceding churn from affecting this
+        # test.
         settle(cfg)
         reset_stats(cfg.host, cfg.port, cfg.timeout)
         try:
             results[key] = func(cfg)
-        # One case's failure is recorded and the run goes on to the next.
+        # A failed case is recorded before the run continues.
         except Exception as exc:  # noqa: BLE001
             results[key] = {"error": str(exc)}
             print(f"  test errored: {exc}", file=sys.stderr)
@@ -2980,9 +2661,7 @@ def main(argv=None):
     comparison = history_comparison(results, cfg.info)
     print("History comparison (review evidence): " + json.dumps(comparison))
 
-    # UTC, not local time: a baseline is compared against runs taken on other
-    # machines, and a naive local stamp orders them by the writer's timezone.
-    # The recorded timestamp carries its offset, so it reads unambiguously.
+    # UTC timestamps order runs consistently across client timezones.
     now = datetime.datetime.now(datetime.UTC)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2991,10 +2670,8 @@ def main(argv=None):
         "timestamp": now.isoformat(timespec="seconds"),
         "host": cfg.host,
         "port": cfg.port,
-        # Build type and profile are conditions of every figure below
-        # (EN-06.7). Recovering them from t5.lock_hold_samples worked only
-        # because the AR-3 sampler is #ifndef NDEBUG, so it stops the moment
-        # that changes.
+        # Build type and profile come from device identity, independently of
+        # lock-hold sampling (AR-3).
         "info": cfg.info,
         "conditions": {
             "build_type": cfg.info.get("build_type"),
@@ -3004,16 +2681,16 @@ def main(argv=None):
         "results": results,
         "rf_health": health,
         "history_comparison": comparison,
-        # lwIP's high-water marks since boot, read once the suite is done: the
-        # record the reference lwipopts' heap and pool bounds are checked against.
+        # Post-suite heap and pool peaks check the reference budgets against
+        # load.
         "lwip_stats_end": _safe_lwip(cfg),
     }
     with out_path.open("w") as fh:
         json.dump(document, fh, indent=2)
     print(f"Results written to {out_path}")
 
-    # Only functional/device-internal failures and case errors affect exit.
-    # Network figures, RF health and history comparisons are review evidence.
+    # Functional failures, internal timing and case errors decide exit status.
+    # Network and history figures are review evidence.
     failures = sorted(
         key for key, data in results.items()
         if "error" in data or data.get("pass") is False)
@@ -3021,7 +2698,6 @@ def main(argv=None):
         print(f"FAILED: {', '.join(failures)}", file=sys.stderr)
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

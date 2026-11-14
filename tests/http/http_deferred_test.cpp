@@ -1,12 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Deferred completion (AR-9), the BR-12 deferral cap and the handler deadline
-// (TR-6).
-//
-// The cases that matter here are the ones where the connection changes state
-// while a handler still owes it a response: a timeout, a peer reset, a server
-// stop, a duplicate completion, a *later request on the same connection*. Each
-// is a misdirected response or a stranded deferral if the request-scoped handle
-// or a release path is wrong, and none is reachable from the synchronous tests.
+// Deferred completion and its limits (AR-9, BR-12, TR-6).
 #include <gtest/gtest.h>
 
 #include <cstddef>
@@ -32,17 +25,13 @@ namespace {
 constexpr std::string_view GET_DEFER = "GET /defer HTTP/1.1\r\nHost: x\r\n\r\n";
 constexpr std::string_view GET_NOW = "GET /now HTTP/1.1\r\nHost: x\r\n\r\n";
 
-// A handler that parks the request and records what it was given. It keeps no
-// pointer to the response — that is the contract (AR-9) — only the RequestId,
-// and answers later through a filler.
+// The handler retains only the RequestId (AR-9).
 struct Deferrer {
     std::vector<RequestId> parked;
-    // Copied out of the request view at handler time, to compare against what
-    // the same view says after the deferral.
+    // The saved URI detects changes to the request view during deferral.
     std::string uri_at_dispatch;
-    // What the filler writes, and how many times it ran. A filler that runs for
-    // a request the service should have rejected shows up here as a count, even
-    // when nothing reaches the wire.
+    // The count detects a filler run for a request the service should have
+    // rejected, even without wire output.
     std::string body = "late";
     int fills = 0;
 
@@ -61,8 +50,6 @@ struct Deferrer {
     }
 };
 
-// Registers /defer and /now on a harness, returning the deferrer that owns the
-// parked ids.
 struct DeferHarness {
     Harness harness;
     Deferrer deferrer;
@@ -85,8 +72,6 @@ struct DeferHarness {
         return id;
     }
 
-    // Record the completion, then run the async-context turn that respond()
-    // asked for. Separated in the tests that care which half does what.
     bool resolve(RequestId id, std::string_view body = "late") {
         deferrer.body = std::string(body);
         const bool recorded =
@@ -101,8 +86,6 @@ struct DeferHarness {
 };
 
 }  // namespace
-
-// --- the deferral itself ---------------------------------------------------
 
 TEST(DeferredTest, PendingHandlerSendsNothingUntilRespond) {
     DeferHarness fixture;
@@ -125,9 +108,7 @@ TEST(DeferredTest, RespondPerformsNoSendItselfAndRingsTheDoorbell) {
     DeferHarness fixture;
     const ConnectionId id = fixture.open_and_defer();
 
-    // respond() is documented as safe from core 1 and from an ISR (AR-9), which
-    // is only true while it performs no send and makes no lwIP call. It records
-    // and rings; the turn does the rest.
+    // respond() makes no send or lwIP call before the async turn (AR-9).
     EXPECT_TRUE(fixture.harness.service->respond(
         fixture.last_parked(), &Deferrer::fill, &fixture.deferrer));
     EXPECT_EQ(fixture.harness.wire->sent_text(id), "")
@@ -151,9 +132,8 @@ TEST(DeferredTest, RequestViewSurvivesTheDeferralWindow) {
     const ConnectionId id = fixture.open_and_defer();
     EXPECT_EQ(fixture.deferrer.uri_at_dispatch, "/defer");
 
-    // The parser must still hold the request: the handler's views point into
-    // it, and the framing decisions at completion read it again. Anything that
-    // reset it would show up as a corrupt response line below.
+    // The parser must retain the request for the handler's views and
+    // completion framing.
     EXPECT_TRUE(fixture.resolve(fixture.last_parked(), "ok"));
     fixture.harness.flush(id);
 
@@ -164,9 +144,9 @@ TEST(DeferredTest, RequestViewSurvivesTheDeferralWindow) {
 TEST(DeferredTest, PipelinedRequestWaitsForTheDeferralThenIsServed) {
     DeferHarness fixture;
     const ConnectionId id = fixture.harness.connect();
-    // Both requests arrive in one segment. The second must not be dispatched
-    // while the first is parked -- doing so would reset the parser under the
-    // first handler's feet (AR-9) and answer out of order.
+    // The second request must not dispatch while the first is parked.
+    // Resetting the parser would invalidate the first request and reorder
+    // replies (AR-9).
     fixture.harness.wire->deliver_text(
         id, std::string(GET_DEFER) + std::string(GET_NOW));
 
@@ -190,17 +170,11 @@ TEST(DeferredTest, RequestArrivingDuringTheDeferralIsNotDispatched) {
     ASSERT_EQ(fixture.harness.service->statistics().pending_dispatches, 1U);
     const std::string parked_uri = fixture.deferrer.uri_at_dispatch;
 
-    // Separate delivery, so this re-enters process() with the slot already
-    // parked -- the case the loop condition guards, as opposed to the in-loop
-    // break that covers a pipelined pair arriving together. Dispatching here
-    // would reset the parser under the parked handler's request views (AR-9).
+    // Separate delivery re-enters process() with a parked request (AR-9).
     fixture.harness.wire->deliver_text(id, GET_NOW);
 
-    // The sharp signal is that the handler was not entered a second time. With
-    // the slot parked the parser still reports the completed first request, so
-    // a process() that does not check `pending` re-dispatches *that* request --
-    // same URI, nothing sent, nothing completed. Only the invocation count
-    // distinguishes it.
+    // Without the pending guard, the parser presents the first request again.
+    // Only the invocation count detects that redispatch.
     EXPECT_EQ(fixture.deferrer.parked.size(), 1U)
         << "the parked request was dispatched to its handler again";
     EXPECT_EQ(fixture.harness.service->statistics().pending_dispatches, 1U);
@@ -226,12 +200,8 @@ TEST(DeferredTest, ParkedDeferralWithBufferedBytesCountsAsWindowThrottle) {
     ASSERT_EQ(fixture.harness.service->statistics().rx_window_throttle_events,
               0U);
 
-    // Bytes arriving behind a parked handler are held, unconsumed, with the
-    // receive window closed against the peer for as long as TR-6 allows. That
-    // is the same observable effect as backpressure behind a draining response,
-    // and OR-1 names the effect -- so it must be counted. Counting only the
-    // draining case leaves the one new source of sustained throttling in this
-    // release invisible.
+    // Bytes held behind a parked handler must count as receive-window
+    // throttling until completion or timeout (TR-6, OR-1).
     fixture.harness.wire->deliver_text(id, GET_NOW);
 
     EXPECT_GE(fixture.harness.service->statistics().rx_window_throttle_events,
@@ -239,21 +209,18 @@ TEST(DeferredTest, ParkedDeferralWithBufferedBytesCountsAsWindowThrottle) {
         << "a deferral holding the window closed was not counted";
 }
 
-// --- stale, duplicate and abandoned completions ----------------------------
-
 TEST(DeferredTest, RespondAfterPeerResetIsInert) {
     DeferHarness fixture;
     const ConnectionId id = fixture.open_and_defer();
     const RequestId parked = fixture.last_parked();
 
     fixture.harness.wire->reset_peer(id);
-    // The deferral must go back to the BR-12 cap on the disconnect, not linger
-    // until TR-6.
+    // The disconnect must release the deferral against the cap before the
+    // handler deadline (BR-12, TR-6).
     EXPECT_EQ(fixture.harness.service->pending_responses(), 0U);
 
-    // The handler answers anyway. This is the race the generation tag exists
-    // for (AR-4): it must not write into a slot that now belongs to nobody, or
-    // to the next peer.
+    // A late completion must not write into an unowned or reassigned slot
+    // (AR-4).
     EXPECT_FALSE(fixture.resolve(parked, "too late"));
     EXPECT_EQ(fixture.deferrer.fills, 0)
         << "the filler ran for a request whose connection was gone";
@@ -265,14 +232,10 @@ TEST(DeferredTest, LateCompletionCannotReachAnotherConnectionsResponse) {
     const ConnectionId first = fixture.open_and_defer();
     const RequestId abandoned = fixture.last_parked();
 
-    // The first connection dies while its handler is still working. Its
-    // response object goes back to the pool here.
     fixture.harness.wire->reset_peer(first);
 
-    // A second connection arrives and defers, so it now owns whatever the first
-    // one released. This is the step that separates "released" from "safe": if
-    // the abandoned handler still held a pointer into the pool, its late write
-    // would land in this connection's live response and be sent to this peer.
+    // A late write through a retained response pointer would corrupt the
+    // second connection's response.
     const ConnectionId second = fixture.open_and_defer();
     const RequestId live = fixture.last_parked();
     ASSERT_FALSE(abandoned == live);
@@ -284,7 +247,6 @@ TEST(DeferredTest, LateCompletionCannotReachAnotherConnectionsResponse) {
     EXPECT_EQ(fixture.harness.wire->sent_text(second), "")
         << "an abandoned completion wrote into a live connection's response";
 
-    // The live request still answers correctly and with its own body.
     EXPECT_TRUE(fixture.resolve(live, "mine"));
     fixture.harness.flush(second);
     const std::string sent = fixture.harness.wire->sent_text(second);
@@ -302,11 +264,8 @@ TEST(DeferredTest, CompletionForAnEarlierRequestOnTheSameConnectionIsInert) {
     ASSERT_NE(fixture.harness.wire->sent_text(id).find("first"),
               std::string::npos);
 
-    // The same keep-alive connection defers again. Its ConnectionId is
-    // unchanged -- generation only moves when the slot is recycled -- so a
-    // handle that named only the connection would now match this second
-    // request, and the first handler's retry would resolve it with the wrong
-    // body. The sequence in RequestId is what rejects it.
+    // The ConnectionId is unchanged on keep-alive. Only the RequestId
+    // sequence rejects the earlier request's late completion.
     fixture.harness.wire->deliver_text(id, GET_DEFER);
     const RequestId second = fixture.last_parked();
     ASSERT_EQ(first.connection, second.connection);
@@ -371,8 +330,7 @@ TEST(DeferredTest, SecondRespondForTheSameRequestIsInert) {
 
 TEST(DeferredTest, HandlerReceivesTheRequestItMustRespondOn) {
     DeferHarness fixture;
-    // Two live connections, so a handler that reported a fixed or stale handle
-    // rather than the request's own would answer the wrong peer.
+    // Two live connections expose a handle that names the wrong peer.
     const ConnectionId first = fixture.open_and_defer();
     const ConnectionId second = fixture.open_and_defer();
 
@@ -380,8 +338,6 @@ TEST(DeferredTest, HandlerReceivesTheRequestItMustRespondOn) {
     EXPECT_EQ(fixture.deferrer.parked[0].connection, first);
     EXPECT_EQ(fixture.deferrer.parked[1].connection, second);
 
-    // Answering via the handle the handler was given reaches that connection
-    // only.
     EXPECT_TRUE(fixture.resolve(fixture.deferrer.parked[1], "second"));
     fixture.harness.flush(second);
     EXPECT_NE(fixture.harness.wire->sent_text(second).find("second"),
@@ -394,13 +350,11 @@ TEST(DeferredTest, RespondOnAnUnknownRequestIsInert) {
     EXPECT_FALSE(fixture.harness.service->respond(RequestId{}, &Deferrer::fill,
                                                   &fixture.deferrer));
     const ConnectionId id = fixture.harness.connect();
-    // Live connection, but no handler ever deferred on it.
     EXPECT_FALSE(fixture.harness.service->respond(
         RequestId{.connection = id, .sequence = 1}, &Deferrer::fill,
         &fixture.deferrer));
-    // A null filler has nothing to run, so it is rejected rather than recorded
-    // and dereferenced on the turn.
     const ConnectionId parked = fixture.open_and_defer();
+    // A null filler is rejected rather than recorded.
     EXPECT_FALSE(fixture.harness.service->respond(fixture.last_parked(),
                                                   nullptr, &fixture.deferrer));
     EXPECT_EQ(fixture.harness.wire->sent_text(parked), "");
@@ -416,15 +370,10 @@ TEST(DeferredTest, ServerStopReleasesEveryDeferral) {
     EXPECT_EQ(fixture.harness.service->pending_responses(), 0U);
 }
 
-// --- a handler that resolves inside its own body ---------------------------
-
 TEST(DeferredTest, HandlerRespondingInlineIsCompletedRatherThanParked) {
     Harness harness;
     Deferrer deferrer;
-    // A handler whose async work was already done: it calls respond() from its
-    // own frame and then returns PENDING. Nothing in the API forbids this, and
-    // a completion source that sometimes runs synchronously produces it without
-    // the handler's author choosing to.
+    // An async completion source can finish synchronously inside the handler.
     ASSERT_TRUE(harness.service->add_route(
         "GET", "/inline",
         [&harness, &deferrer](const HTTPRequestView& request, HTTPResponse&) {
@@ -442,30 +391,25 @@ TEST(DeferredTest, HandlerRespondingInlineIsCompletedRatherThanParked) {
     EXPECT_NE(sent.find("200 OK"), std::string::npos) << sent;
     EXPECT_NE(sent.find("inline"), std::string::npos) << sent;
     EXPECT_EQ(deferrer.fills, 1);
-    // Completed as the handler returned, so nothing is parked and nothing is
-    // waiting on TR-6.
+    // Completion before the handler returns leaves no parked request (TR-6).
     EXPECT_EQ(harness.service->pending_responses(), 0U);
     EXPECT_EQ(harness.service->statistics().requests_completed, 1U);
 }
 
-// --- the BR-12 deferral cap ------------------------------------------------
+// Deferral capacity (BR-12).
 
 TEST(DeferredTest, DeferralCapAnswers503AndRecoversWhenOneResolves) {
     DeferHarness fixture;
     std::vector<RequestId> ids;
     ids.reserve(HttpService::MAX_PENDING);
     for (std::size_t i = 0; i < HttpService::MAX_PENDING; ++i) {
-        // The connection id is not needed: the request-scoped handle is what
-        // resolves a deferral, and last_parked() reports it.
         static_cast<void>(fixture.open_and_defer());
         ids.push_back(fixture.last_parked());
     }
     EXPECT_EQ(fixture.harness.service->pending_responses(),
               HttpService::MAX_PENDING);
 
-    // One deferral past the cap. The refusal is built on the stack, so it needs
-    // no response entry of its own -- which is what makes it reportable at the
-    // moment it occurs (BR-12).
+    // The overload response needs no pool entry (BR-12).
     const ConnectionId refused = fixture.open_and_defer();
     fixture.harness.flush(refused);
 
@@ -475,12 +419,11 @@ TEST(DeferredTest, DeferralCapAnswers503AndRecoversWhenOneResolves) {
 
     const auto& stats = fixture.harness.service->statistics();
     EXPECT_EQ(stats.deferrals_refused, 1U);
-    // An overload is not a malformed request; it must not land in parse_errors.
+    // An overload must not increment parse_errors.
     EXPECT_EQ(stats.parse_errors, 0U);
     EXPECT_EQ(stats.pending_high_watermark, HttpService::MAX_PENDING);
 
-    // Resolving one deferral frees exactly one place, and deferring works
-    // again -- the cap must be transient, not a permanent wedge.
+    // The cap must allow another deferral once one completes.
     EXPECT_TRUE(fixture.resolve(ids.back(), "x"));
     EXPECT_EQ(fixture.harness.service->pending_responses(),
               HttpService::MAX_PENDING - 1);
@@ -494,13 +437,8 @@ TEST(DeferredTest, SynchronousRequestIsServedWhileEveryDeferralIsHeld) {
     ASSERT_EQ(fixture.harness.service->pending_responses(),
               HttpService::MAX_PENDING);
 
-    // A plain synchronous route on a fresh connection, with the deferral cap
-    // fully drawn down. This must be a 200: a handler that answers inline holds
-    // its response object only for the length of its own dispatch, so it is not
-    // subject to BR-12 at all. Claiming against the cap on arrival instead
-    // would let a few slow handlers black-hole every other connection's
-    // ordinary traffic -- including the /stats route an operator would use to
-    // see it.
+    // A synchronous request on a fresh connection must return 200 even when
+    // all deferrals are occupied (BR-12).
     const ConnectionId id = fixture.harness.connect();
     const std::string sent = fixture.harness.round_trip(id, GET_NOW);
 
@@ -513,9 +451,7 @@ TEST(DeferredTest, SynchronousRequestIsServedWhileEveryDeferralIsHeld) {
 TEST(DeferredTest, SynchronousHandlersDoNotAccumulateDeferrals) {
     DeferHarness fixture;
     const ConnectionId id = fixture.harness.connect();
-    // Far more requests than the cap allows. A synchronous handler is never
-    // parked, so if the release path on that dispatch were missing this wedges
-    // at 503 well before the loop ends.
+    // A missing synchronous release exhausts the pool before this loop ends.
     for (int i = 0; i < 50; ++i) {
         const std::string sent = fixture.harness.round_trip(id, GET_NOW);
         ASSERT_NE(sent.find("200 OK"), std::string::npos) << sent;
@@ -525,8 +461,6 @@ TEST(DeferredTest, SynchronousHandlersDoNotAccumulateDeferrals) {
     EXPECT_EQ(stats.deferrals_refused, 0U);
     EXPECT_EQ(stats.pending_dispatches, 0U);
 }
-
-// --- the response pool's own contract --------------------------------------
 
 TEST(PendingPoolTest, ReleaseDropsTheBodyBufferRatherThanHoldingIt) {
     pico_http::detail::PendingPool<2> pool;
@@ -539,12 +473,8 @@ TEST(PendingPoolTest, ReleaseDropsTheBodyBufferRatherThanHoldingIt) {
 
     pool.release(id);
 
-    // Emptiness is not the property under test -- the capacity is. An entry is
-    // the swap partner for a connection slot's body buffer (BodySource::adopt),
-    // so after a buffered response it holds the slot's *previous* buffer.
-    // Holding that until some later claim happens to land on this entry leaves
-    // the heap live with no connection owning it, which puts peak copied-body
-    // allocation above AR-1's MAX_CONNECTIONS x MAX_BUFFERED_BODY bound.
+    // adopt() swaps body buffers. Retaining the slot's previous buffer after
+    // release would exceed the copied-body heap bound (AR-1).
     EXPECT_EQ(entry->body.capacity(), 0U);
     EXPECT_EQ(pool.in_use(), 0U);
 }

@@ -9,10 +9,7 @@
 #include "pico_http/tcp/connection_id.hpp"
 
 /// \file slot_table.hpp
-/// Fixed-capacity table of per-connection slots with generation-tagged handles.
-/// Makes stale-handle use structurally safe (AR-4): a reused slot carries a
-/// new generation, so a ConnectionId minted before the reuse no longer
-/// resolves. Pure C++ (no lwIP); host-testable.
+/// Fixed slots with generation-checked connection handles (AR-4).
 
 namespace pico_http::tcp::detail {
 
@@ -27,9 +24,8 @@ class SlotTable {
    public:
     static constexpr std::size_t CAPACITY = Capacity;
 
-    /// Claim a free slot. Returns an invalid ConnectionId when the table is
-    /// full. The returned slot payload is left as-is from its previous life;
-    /// the caller is responsible for (re)initialising it.
+    /// Claim a slot, or return an invalid id when full. The caller
+    /// initialises the retained payload.
     ConnectionId acquire() noexcept {
         for (std::size_t i = 0; i < Capacity; ++i) {
             if (!entries_[i].occupied) {
@@ -43,9 +39,8 @@ class SlotTable {
         return ConnectionId{};
     }
 
-    /// Free the slot named by id. Bumps the slot's generation so the id (and
-    /// any copy of it) can never resolve again. Returns false if id was already
-    /// stale or invalid (idempotent teardown is a no-op, not a fault).
+    /// Release a slot and advance its generation. Return false for a stale or
+    /// invalid id.
     bool release(ConnectionId id) noexcept {
         Entry* entry = live_entry(id);
         if (entry == nullptr) {
@@ -77,12 +72,10 @@ class SlotTable {
                                   entries_[index].generation);
     }
 
-    /// Invoke fn(ConnectionId, Slot&) for each occupied slot. `fn` is taken by
-    /// forwarding reference but deliberately never forwarded: it is called once
-    /// per occupied slot, so moving out of it on the first call would leave the
-    /// rest of the sweep invoking a moved-from callable.
+    /// Invoke fn for each occupied slot without forwarding a repeatedly used
+    /// callable.
     template <typename Fn>
-    // Never forwarded, for the reason in the doc comment above.
+    // cppcoreguidelines-missing-std-forward: fn is called repeatedly.
     // NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
     void for_each_active(Fn&& fn) {
         for (std::size_t i = 0; i < Capacity; ++i) {

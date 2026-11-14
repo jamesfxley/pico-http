@@ -1,10 +1,5 @@
-# Build-wide sizing policy: slot count, MSS-derived buffer extents, header caps,
-# boundary limits and the named profiles. Header-only, but it is the target that
-# carries the profile compile definitions as INTERFACE usage requirements, so
-# every consumer — in-tree targets, FetchContent users and installed-package
-# users alike — compiles against the same class layout. Setting them with a
-# directory-scoped add_compile_definitions instead would reach only this repo's
-# own targets and silently mismatch a consumer's translation units.
+# Profile definitions propagate as usage requirements because they determine
+# consumer class layouts.
 add_library(pico_http_config INTERFACE)
 add_library(pico_http::config ALIAS pico_http_config)
 
@@ -24,14 +19,8 @@ target_include_directories(pico_http_config INTERFACE
 
 target_compile_features(pico_http_config INTERFACE cxx_std_20)
 
-# The header-storage caps. sizing.hpp declares them with an #ifndef so a value
-# can come from the compile line, but a bare -D on a consumer's own target
-# reaches only that consumer's translation units: the archive it links was
-# compiled with the default, the two disagree about the layout of every
-# HTTPHeaders crossing the boundary, and ProfileBinding aborts in the
-# HttpService constructor at boot. Setting them here puts one value on the
-# target every consumer compiles against, which is the only place the override
-# can be made whole.
+# Header capacities are set on the shared config target so the archive and
+# consumers agree.
 set(PICO_HTTP_MAX_HEADER_NAME "" CACHE STRING
     "Longest stored header name in bytes (default 64). Empty keeps the default.")
 set(PICO_HTTP_MAX_HEADER_VALUE "" CACHE STRING

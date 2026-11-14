@@ -11,24 +11,15 @@
 
 namespace pico_http {
 
-/// Fixed-capacity byte ring for zero-copy TCP transmission.
-///
-/// Bytes move through three regions in FIFO order:
-///   written (unsent) -> sent (in-flight, awaiting ACK) -> released on ack().
-/// Data handed to the transport with a no-copy write must stay valid until the
-/// peer acknowledges it, so bytes are only reclaimed in ack() — never when they
-/// are merely handed off in mark_sent(). This lets the caller pass spans from
-/// the ring straight to tcp_write() without TCP_WRITE_FLAG_COPY.
-///
-/// No heap: storage is a std::array<uint8_t, Capacity>. All operations are O(1)
-/// except write()/the wrap-splitting peek, which are O(bytes moved).
+/// Fixed-capacity transmit storage. NOCOPY bytes must remain valid until ACK.
+/// ack() reclaims bytes; mark_sent() retains them for retransmission. write()
+/// copies bytes; other operations are constant-time.
 template <std::size_t Capacity>
 class TxRing {
     static_assert(Capacity > 0, "TxRing capacity must be non-zero");
 
    public:
-    /// The template's Capacity, exposed so a consumer can size a buffer or an
-    /// assertion against the ring without repeating the number.
+    /// Capacity in bytes.
     static constexpr std::size_t CAPACITY = Capacity;
 
     /// Total live bytes (unsent + in-flight).
@@ -48,8 +39,7 @@ class TxRing {
     /// so a retransmission can re-read them.
     [[nodiscard]] std::size_t in_flight() const noexcept { return in_flight_; }
 
-    /// Whether nothing is unsent or in flight. Not the same as full capacity
-    /// being available only if nothing was ever written.
+    /// True when no bytes are unsent or in flight.
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
 
     /// Copy up to free_space() bytes from data into the ring. Returns the
@@ -75,9 +65,8 @@ class TxRing {
         return to_copy;
     }
 
-    /// Contiguous span of not-yet-sent bytes starting at the send cursor. When
-    /// the unsent region wraps the physical buffer this returns only the run up
-    /// to the wrap point; call mark_sent() then peek() again for the remainder.
+    /// The contiguous unsent run, ending at the buffer wrap. mark_sent()
+    /// exposes the next run.
     [[nodiscard]] std::span<const std::uint8_t> peek() const noexcept {
         if (unsent_ == 0) {
             return {};
@@ -90,28 +79,23 @@ class TxRing {
                                              run);
     }
 
-    /// Reclassify n unsent bytes as in-flight (handed to the transport). The
-    /// bytes remain resident until ack() so retransmission can re-read them.
-    /// Saturating credit: the adapter bounds n by peek().size().
+    /// Mark up to n unsent bytes in flight, retaining them until ack().
     void mark_sent(std::size_t n) noexcept {
         n = std::min(n, unsent_);
         unsent_ -= n;
         in_flight_ += n;
     }
 
-    /// Release acknowledged credit, saturating at the in-flight count.
-    /// The lwIP adapter passes only bytes acknowledged on this ring's PCB;
-    /// architecture.md explains the credit bounds and callback lifetime.
+    /// Release up to n in-flight bytes. The adapter bounds credit as
+    /// described in architecture.md.
     void ack(std::size_t n) noexcept {
         n = std::min(n, in_flight_);
         head_ = index_of(n);  // advance head by n (index_of already adds head_)
         in_flight_ -= n;
     }
 
-    /// Drop everything, including bytes still in flight. For connection
-    /// teardown only: the transport may still hold references to in-flight
-    /// bytes, so calling this on a live connection abandons data the peer will
-    /// never see.
+    /// Clear storage during teardown only. A live transport can still
+    /// reference in-flight bytes.
     void clear() noexcept {
         head_ = pico_util::RingPosition{};
         unsent_ = 0;
@@ -121,11 +105,8 @@ class TxRing {
    private:
     [[nodiscard]] pico_util::RingPosition index_of(
         std::size_t offset_from_head) const noexcept {
-        // pico_util::ring_index compares and resets rather than dividing,
-        // which is what a target with no division instruction wants. Valid
-        // here because the ring's occupancy invariant keeps
-        // head_ + offset_from_head below 2 * Capacity: head_ is an index and
-        // unsent_ + in_flight_ never exceeds Capacity.
+        // Ring occupancy keeps head_ + offset_from_head below 2 * Capacity,
+        // as ring_index requires.
         return pico_util::ring_index<Capacity>(
             head_, pico_util::RingCount{offset_from_head});
     }

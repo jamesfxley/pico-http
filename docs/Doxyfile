@@ -1,10 +1,5 @@
-# Doxygen configuration for the pico-http API reference.
-#
-# Everything that does not vary lives in infra/house/config/Doxyfile.base; only the three
-# fields below differ between repositories. Doxygen applies assignments in
-# order, so these win over the include.
-#
-#   doxygen docs/Doxyfile      (output: docs/api/html/index.html, gitignored)
+# Repository fields override the included House defaults. Run doxygen
+# docs/Doxyfile to write docs/api/html/index.html.
 
 @INCLUDE_PATH = infra/house/config
 @INCLUDE      = Doxyfile.base

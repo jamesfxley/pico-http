@@ -19,9 +19,8 @@ namespace pico_http::testing {
 
 namespace detail {
 
-/// Default simulated transmit buffer and receive window, both 2 x TCP_MSS: the
-/// default profile's receive window, and a transmit buffer small enough that
-/// the host tests reach backpressure, unless a test overrides it.
+/// Default simulated TX capacity and RX window in bytes. TX is small enough
+/// to exercise backpressure.
 inline constexpr std::size_t DEFAULT_SIM_CAPACITY =
     2 * ::pico_http::TCP_MSS_BYTES;
 
@@ -42,13 +41,8 @@ struct ClientSim {
 
 }  // namespace detail
 
-/// Host test double implementing ITcpTransport. Simulates a bounded transmit
-/// buffer (credit-based send + ack-driven writable events), a bounded receive
-/// window (deliver throttled by unconsumed bytes), and connection teardown
-/// with typed reasons. Slot handling, timeouts, the drain-close lifecycle and
-/// deferred disconnect delivery all come from TransportBase, so this double and
-/// the firmware transport share one implementation of the semantics tests rely
-/// on (AR-4).
+/// Host transport with bounded send and receive credit. Shared slots and
+/// teardown come from TransportBase (AR-4).
 class FakeTcpTransport
     : public tcp::TransportBase<detail::ClientSim,
                                 ::pico_http::MAX_CONNECTIONS> {
@@ -72,15 +66,11 @@ class FakeTcpTransport
     void consume(ConnectionId client, std::size_t bytes) override;
     void set_idle_timeout(std::uint32_t seconds) override;
 
-    /// AR-9 doorbell. Records the ring rather than servicing it: a test decides
-    /// when the async-context turn happens by calling
-    /// run_pending_completions(), which is what makes the deferred path
-    /// deterministic on the host.
+    /// Records a completion signal for a later run_pending_completions() call
+    /// (AR-9).
     void signal_completion() override { ++completion_signals_; }
 
-    /// Take one recorded doorbell and deliver the on_poll() the firmware's
-    /// async context would. Returns false when none is pending, so a test can
-    /// assert that respond() did *not* ring.
+    /// Deliver one recorded on_poll(), or return false if none is pending.
     bool run_pending_completions() {
         if (completion_signals_ == 0) {
             return false;
@@ -95,11 +85,8 @@ class FakeTcpTransport
         return completion_signals_;
     }
 
-    /// AR-3 completion bracket. The firmware transport takes a critical section
-    /// here; a host transport has one context and nothing to exclude, so this
-    /// double records the bracket instead of holding anything. Recording it is
-    /// what makes the host suite run the code path the firmware locks, and what
-    /// makes an unbalanced bracket observable rather than silent.
+    /// Records completion-lock brackets without locking on the single-context
+    /// host (AR-3).
     void lock_completions() override {
         ++completion_lock_depth_;
         ++completion_locks_taken_;
@@ -123,11 +110,8 @@ class FakeTcpTransport
         return completion_locks_taken_;
     }
 
-    /// Brackets taken after close_server(). Non-zero is correct and required:
-    /// HttpService::stop() closes the server and then clears every slot under
-    /// this lock, so a transport whose lock does not outlive its server is
-    /// broken. The count exists so that requirement is asserted somewhere
-    /// rather than assumed.
+    /// Counts lock brackets taken after close_server(), as required by
+    /// HttpService::stop().
     [[nodiscard]] std::uint32_t completion_locks_after_close_server() const {
         return completion_locks_after_close_server_;
     }
@@ -137,13 +121,8 @@ class FakeTcpTransport
         return completion_lock_depth_ == 0 && completion_lock_underflows_ == 0;
     }
 
-    // --- Lambda registration (test-only sugar) ------------------------------
-    //
-    // The library API is set_event_sink(ITransportEvents*). These forward to an
-    // owned sink so tests can register a lambda per event instead of declaring
-    // a class. Host-only, so the std::function allocation they cost is free of
-    // the AR-1 constraint that shaped the real interface.
-    /// Register a lambda for on_connect.
+    /// Register an on_connect lambda in the host-only owned event sink
+    /// (AR-1).
     void set_on_connect(std::function<void(ConnectionId)> cb);
     /// Register a lambda for on_disconnect.
     void set_on_disconnect(
@@ -165,30 +144,25 @@ class FakeTcpTransport
     /// Peer sends RST: fires on_disconnect(PEER_RESET) and frees the slot.
     void reset_peer(ConnectionId client);
 
-    /// The local stack aborts the connection (lwIP's error callback with an
-    /// error other than a reset): fires on_disconnect(ABORTED) and frees the
+    /// Inject a local stack abort and report ABORTED after releasing the
     /// slot.
     void abort_local(ConnectionId client);
 
     /// Peer sends FIN: fires on_disconnect(PEER_CLOSED) and frees the slot.
     void close_peer(ConnectionId client);
 
-    /// Deliver inbound bytes, throttled by the open receive window. Returns the
-    /// number actually delivered to on_receive (a short return means the window
-    /// is closed pending consume()).
+    /// Deliver bytes up to receive-window credit and return the count
+    /// delivered.
     std::size_t deliver(ConnectionId client,
                         std::span<const std::uint8_t> data);
     /// deliver() over the bytes of `text`, for the common case of a test
     /// feeding a request written as a string literal.
     std::size_t deliver_text(ConnectionId client, std::string_view text);
 
-    /// Deliver one arrival split across several on_receive calls inside a
-    /// single callback scope, the way the lwIP transport walks a chained pbuf.
-    /// Distinct from calling deliver() repeatedly, which opens a scope per
-    /// call: only this shape can raise a teardown *between* segments of one
-    /// arrival, so it is what covers the transport's mid-chain liveness check.
-    /// Returns the number of bytes actually delivered; stops early once the
-    /// receive window closes or the connection goes away.
+    /// Deliver segments inside one callback scope, stopping at teardown or a
+    /// closed receive window.
+    /// Return bytes delivered. Unlike repeated deliver(), disconnect
+    /// notification waits until all segments finish.
     std::size_t deliver_segmented(ConnectionId client,
                                   std::span<const std::string_view> segments);
 
@@ -196,19 +170,16 @@ class FakeTcpTransport
     /// space and firing on_writable with the amount freed.
     void deliver_ack(ConnectionId client, std::size_t bytes);
 
-    /// Advance the simulated clock by `ms` and fire every timeout whose
-    /// deadline has now passed — the test-side stand-in for the firmware's
-    /// periodic timeout worker. Each fired connection is torn down with the
-    /// matching TIMEOUT_* / SERVER_CLOSED reason.
+    /// Advance virtual time in milliseconds and tear down expired connections
+    /// with their matching reason.
     void advance_time(std::uint32_t ms);
 
     /// The simulated clock, in milliseconds since construction. Only
     /// advance_time() moves it.
     [[nodiscard]] std::uint32_t now_ms() const { return now_ms_; }
 
-    // --- Configuration ------------------------------------------------------
-    /// Transmit buffer size for connections opened after this call. A small
-    /// value is how a test exercises the stalled-writer paths.
+    /// Sets TX capacity for connections opened later. Small values exercise
+    /// backpressure.
     void set_send_capacity(std::size_t bytes) { send_capacity_ = bytes; }
 
     /// Receive window for connections opened after this call. A small value is
@@ -252,13 +223,9 @@ class FakeTcpTransport
     /// Port passed to the most recent listen(). No socket is ever opened.
     [[nodiscard]] std::uint16_t last_port() const { return last_port_; }
 
-    /// Whether the server is closed -- that is, close_server() has been called
-    /// and no later listen() has succeeded.
-    ///
-    /// While this is true the double models a transport that is not listening:
-    /// connect() returns an invalid id without any callback, and advance_time()
-    /// runs no timeout sweep. Both match what close_server() does to the
-    /// listening pcb and the async-context workers on the firmware transport.
+    /// True after close_server() until a successful listen().
+    /// While closed, connect() returns an invalid id without callbacks and
+    /// advance_time() skips deadlines.
     [[nodiscard]] bool server_closed() const { return server_closed_; }
 
     /// The idle timeout the service last configured, in seconds.
@@ -282,10 +249,8 @@ class FakeTcpTransport
         sim.close_pending = true;
     }
 
-    /// TransportBase hook: reset the simulation state for a slot being torn
-    /// down and record the disconnect for disconnects(). Raises no callbacks —
-    /// the base delivers the notification itself, after the callback scope
-    /// unwinds.
+    /// Reset slot simulation state and record the disconnect. The base
+    /// reports the event after callback return.
     void release_slot_resources(ConnectionId client, detail::ClientSim& sim,
                                 DisconnectReason reason) override;
 

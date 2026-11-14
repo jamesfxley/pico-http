@@ -5,16 +5,12 @@
 #include <cstdint>
 
 /// \file connection_id.hpp
-/// Stable, ABA-safe connection handle. Replaces raw tcp_pcb* pointers in the
-/// public API so that an operation naming a connection that has since been torn
-/// down and its slot reused is rejected instead of touching a stale pointer.
-/// Pure C++ (no lwIP); host-testable.
+/// Host-safe packed connection handles with generation checks.
 
 namespace pico_http::tcp {
 
-/// Packed {slot:8, generation:16, tag:8} identifier. A raw value of 0 is the
-/// reserved invalid sentinel; the slot allocator never issues generation 0, so
-/// no live connection can encode to 0.
+/// Packed slot:8, generation:16 and tag:8 fields. Zero is invalid; slot
+/// allocation skips generation zero.
 class ConnectionId {
     static constexpr std::uint32_t SLOT_MASK = 0xFFU;
     static constexpr std::uint32_t GEN_SHIFT = 8U;
@@ -29,10 +25,8 @@ class ConnectionId {
 
     constexpr ConnectionId() = default;
 
-    /// Pack a slot index, a generation counter and an optional tag into one id.
-    /// The generation is what makes a stale id detectable: reusing a slot bumps
-    /// it, so an id held across a close names a connection that no longer
-    /// exists rather than silently addressing its replacement.
+    /// Pack a slot, generation and optional tag. Releasing a slot changes its
+    /// generation.
     static constexpr ConnectionId make(std::uint8_t slot,
                                        std::uint16_t generation,
                                        std::uint8_t tag = 0) noexcept {
@@ -42,9 +36,8 @@ class ConnectionId {
             (static_cast<std::uint32_t>(tag) << TAG_SHIFT));
     }
 
-    /// Rebuild an id from its packed form, for a caller that stored raw().
-    /// Performs no validation: an arbitrary value yields an id that valid()
-    /// accepts but no slot table will recognise.
+    /// Rebuild a packed id without validation. A nonzero value need not name
+    /// a live slot.
     static constexpr ConnectionId from_raw(std::uint32_t raw) noexcept {
         return ConnectionId(raw);
     }
@@ -68,9 +61,8 @@ class ConnectionId {
         return static_cast<std::uint8_t>((raw_ >> TAG_SHIFT) & TAG_MASK);
     }
 
-    /// Whether this is anything other than the default-constructed id. A packed
-    /// value of zero is reserved to mean "no connection", so slot 0 generation
-    /// 0 is never issued.
+    /// True for any nonzero packed value, including values not issued by a
+    /// slot table.
     [[nodiscard]] constexpr bool valid() const noexcept { return raw_ != 0; }
 
     /// Equality over the whole packed value, tag included — two ids for the

@@ -1,17 +1,13 @@
 set(PICO_HTTP_PUBLIC_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-# config before lwipopts: the reference configuration branches on the profile
-# macro, and the target carrying that macro has to exist before the one
-# carrying the header can link it. config depends on nothing here, so the order
-# is free.
+# Config is created before lwipopts, which links the target carrying its
+# profile macro.
 add_subdirectory(config)
 add_subdirectory(lwipopts)
 add_subdirectory(lwipopts_reference)
 
-# AR-10. The application owns its lwipopts.h; this library asserts what it needs
-# of one and provides none. The variable is the family's rather than this
-# library's, so an application linking pico-http and a second networking
-# library names its configuration once.
+# The application selects one lwIP configuration shared by networking
+# libraries (AR-10).
 if(PICO_HTTP_BUILD_FIRMWARE)
     pico_family_require_lwipopts_target(pico-http
         FALLBACK pico_http_lwipopts_fallback)
@@ -21,8 +17,7 @@ add_subdirectory(util)
 add_subdirectory(tcp)
 add_subdirectory(http)
 
-# Host-side fakes are pointless in firmware images; build them for host
-# consumers and for the test suite.
+# Fake transports are built for host consumers and tests.
 if(NOT PICO_HTTP_BUILD_FIRMWARE)
     add_subdirectory(testing)
 endif()

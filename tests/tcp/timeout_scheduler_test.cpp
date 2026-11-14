@@ -37,12 +37,11 @@ TEST(TimeReachedTest, BasicOrdering) {
 
 TEST(TimeReachedTest, CorrectAcrossThe32BitWrap) {
     constexpr std::uint32_t MAX = std::numeric_limits<std::uint32_t>::max();
-    const std::uint32_t deadline = MAX - 5U;  // near the top of the range
-    const std::uint32_t now = 10U;            // wrapped past zero
+    const std::uint32_t deadline = MAX - 5U;
+    const std::uint32_t now = 10U;
 
-    // 10 is 16 ms after (MAX - 5), so the deadline has been reached.
+    // Across wrap, 10 is 16 ms after MAX - 5.
     EXPECT_TRUE(time_reached(now, deadline));
-    // Just before the deadline, still pending.
     EXPECT_FALSE(time_reached(MAX - 10U, deadline));
 }
 
@@ -81,8 +80,8 @@ TEST(TimeoutSchedulerTest, ReArmDuringExpiryScanReschedules) {
     TimeoutScheduler<2> sched;
     sched.arm(0, 100U, KIND_HEADER);
 
-    // The callback re-arms slot 0 further out; it must not fire twice in this
-    // pass and must be pending for a later now.
+    // The re-armed slot must not fire twice in this pass and must remain
+    // pending for a later time.
     int calls = 0;
     sched.for_each_expired(150U, [&](std::size_t i, std::uint8_t) {
         ++calls;

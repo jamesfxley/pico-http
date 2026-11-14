@@ -6,17 +6,12 @@
 #include <cstdint>
 
 /// \file timeout_scheduler.hpp
-/// Per-slot deadline tracking with wrap-safe millisecond arithmetic (AR-7). One
-/// {deadline, kind} pair per connection slot; a periodic worker calls
-/// for_each_expired() to fire the ones whose deadline has passed. Pure C++ (no
-/// lwIP); host-testable, including across the 2^32 ms (~49.7 day) wrap.
+/// Per-slot deadlines with wrap-safe millisecond arithmetic (AR-7).
 
 namespace pico_http::tcp::detail {
 
-/// True once `now` has reached or passed `deadline`, correct across the 32-bit
-/// millisecond wrap. Relies on modular subtraction: the signed interpretation
-/// of (now - deadline) is non-negative exactly when now is at/after deadline,
-/// provided the two are less than 2^31 ms (~24.8 days) apart.
+/// True when now reaches deadline across 32-bit millisecond wrap.
+/// Requires the two times to be less than 2^31 ms (about 24.8 days) apart.
 inline bool time_reached(std::uint32_t now, std::uint32_t deadline) noexcept {
     return static_cast<std::int32_t>(now - deadline) >= 0;
 }
@@ -48,13 +43,10 @@ class TimeoutScheduler {
         return index < Capacity && entries_[index].active;
     }
 
-    /// Fire every armed slot whose deadline has passed as of `now_ms`. Each
-    /// fired slot is disarmed before fn(index, kind) runs, so fn may re-arm it.
-    /// `fn` is taken by forwarding reference but deliberately never forwarded:
-    /// it is called once per expired slot, so moving out of it on the first
-    /// call would leave the rest of the sweep invoking a moved-from callable.
+    /// Disarm expired slots before invoking fn, so fn may re-arm them. The
+    /// repeatedly used callable is not forwarded.
     template <typename Fn>
-    // Never forwarded, for the reason in the doc comment above.
+    // cppcoreguidelines-missing-std-forward: fn is called repeatedly.
     // NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
     void for_each_expired(std::uint32_t now_ms, Fn&& fn) {
         for (std::size_t i = 0; i < Capacity; ++i) {

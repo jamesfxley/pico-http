@@ -40,11 +40,11 @@ TEST(TxRingTest, WriteReportsCreditAndCapsAtCapacity) {
     EXPECT_EQ(ring.free_space(), 8U);
 
     auto data = iota_bytes(12);
-    EXPECT_EQ(ring.write(data), 8U);  // only 8 fit
+    EXPECT_EQ(ring.write(data), 8U);
     EXPECT_EQ(ring.size(), 8U);
     EXPECT_EQ(ring.unsent(), 8U);
     EXPECT_EQ(ring.free_space(), 0U);
-    EXPECT_EQ(ring.write(data), 0U);  // full: no credit
+    EXPECT_EQ(ring.write(data), 0U);
 }
 
 TEST(TxRingTest, PeekReturnsWrittenBytesInOrder) {
@@ -65,7 +65,7 @@ TEST(TxRingTest, BytesStayResidentUntilAckedNotWhenSent) {
     ring.mark_sent(6);
     EXPECT_EQ(ring.in_flight(), 6U);
     EXPECT_EQ(ring.unsent(), 0U);
-    EXPECT_EQ(ring.free_space(), 2U);  // still occupied until acked
+    EXPECT_EQ(ring.free_space(), 2U);
 
     ring.ack(4);
     EXPECT_EQ(ring.in_flight(), 2U);
@@ -78,17 +78,15 @@ TEST(TxRingTest, BytesStayResidentUntilAckedNotWhenSent) {
 
 TEST(TxRingTest, WriteWrapsAroundPhysicalBuffer) {
     TxRing<8> ring;
-    // Fill, send, ack the first 6 to advance head near the end.
     ring.write(iota_bytes(6, 0));
     ring.mark_sent(6);
     ring.ack(6);
     EXPECT_EQ(ring.free_space(), 8U);
 
-    // This write wraps: 2 bytes at [6,8) and 4 bytes at [0,4).
+    // The write wraps into [6,8) and [0,4).
     auto data = iota_bytes(6, 100);
     EXPECT_EQ(ring.write(data), 6U);
 
-    // peek() only returns the contiguous run to the wrap point.
     auto first = ring.peek();
     EXPECT_EQ(first.size(), 2U);
 
@@ -104,7 +102,7 @@ TEST(TxRingTest, PartialAckThenRefillUsesFreedSpace) {
     EXPECT_EQ(ring.free_space(), 2U);
 
     std::array<std::uint8_t, 3> more{50, 51, 52};
-    EXPECT_EQ(ring.write(more), 2U);  // only 2 free
+    EXPECT_EQ(ring.write(more), 2U);
     EXPECT_EQ(ring.unsent(), 2U);
 
     auto peeked = ring.peek();
@@ -112,14 +110,9 @@ TEST(TxRingTest, PartialAckThenRefillUsesFreedSpace) {
     EXPECT_EQ(got, (std::vector<std::uint8_t>{50, 51}));
 }
 
-// The ring's core contract (and top item in the design risk register): bytes
-// handed to the transport with mark_sent() must stay valid *at their physical
-// location* until ack(), because lwIP NOCOPY retransmissions re-read those
-// pointers. This drives the ring through many partial acks and refills — the
-// pattern of a large streamed download — capturing each in-flight byte's
-// address+value at send time and asserting nothing overwrites it before it is
-// acked. A regression here is invisible on a clean LAN (no retransmits) but
-// corrupts every retransmitted segment. Guards against the ack()-head bug.
+// Sent bytes must stay at their physical addresses until ACK because lwIP
+// retransmits no-copy segments from those pointers. Partial ACKs and refills
+// expose premature reuse.
 TEST(TxRingTest, InFlightBytesStayStableUntilAcked) {
     TxRing<8> ring;
 
@@ -143,7 +136,7 @@ TEST(TxRingTest, InFlightBytesStayStableUntilAcked) {
             }
             ring.mark_sent(run.size());
         }
-        // Every still-unacked byte must read back exactly what was sent.
+        // Every unacknowledged byte must retain its sent value.
         for (const Pending& pending : inflight) {
             ASSERT_EQ(*pending.addr, pending.value)
                 << "in-flight byte clobbered before ack (iter " << iter << ")";
@@ -160,7 +153,7 @@ TEST(TxRingTest, OverAckIsClampedToInFlight) {
     TxRing<4> ring;
     ring.write(iota_bytes(2, 0));
     ring.mark_sent(2);
-    ring.ack(10);  // clamp, no underflow
+    ring.ack(10);
     EXPECT_TRUE(ring.empty());
     EXPECT_EQ(ring.free_space(), 4U);
 }
