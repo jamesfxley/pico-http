@@ -42,6 +42,15 @@ class BodySource {
         }
     }
 
+    /// Serve caller-owned bytes that outlive the response, without an
+    /// HTTPResponse (AR-13).
+    void adopt_static(std::span<const std::uint8_t> bytes) noexcept {
+        reset();
+        mode_ = Mode::STATIC_VIEW;
+        static_ = bytes;
+        total_ = bytes.size();
+    }
+
     /// Reset to an empty buffered body and release copied storage (AR-1).
     void reset() noexcept {
         mode_ = Mode::BUFFERED;

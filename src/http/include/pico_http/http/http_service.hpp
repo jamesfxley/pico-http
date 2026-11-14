@@ -413,7 +413,7 @@ class HttpService : private ITransportEvents {
     // (NR-2, NR-6).
     void complete_request(Conn& conn, RequestId id, HTTPResponse& response);
     // Answer an excess deferral without incrementing parse_errors (BR-12).
-    void serialize_service_unavailable(Conn& conn);
+    static void serialize_service_unavailable(Conn& conn);
     void begin_response(Conn& conn, const HTTPRequestView& request,
                         HTTPResponse& response, bool close_connection);
     // Answer with the fixed 500 and close, freeing the handler's copied body:
@@ -425,6 +425,10 @@ class HttpService : private ITransportEvents {
         std::span<std::uint8_t> head, const Conn& conn,
         std::string_view version, const HTTPResponse& response,
         detail::Framing framing, bool close_connection) const;
+    // Write a boundary response head and static reason-phrase body into the
+    // connection's writer and close, building no HTTPResponse (AR-13).
+    static void begin_boundary_response(Conn& conn, std::uint16_t code,
+                                        std::string_view reason);
     void serialize_error(Conn& conn, ParseResult error);
     void pump(Conn& conn, ConnectionId id);
     [[nodiscard]] bool should_keep_alive(const HTTPRequestView& request,
