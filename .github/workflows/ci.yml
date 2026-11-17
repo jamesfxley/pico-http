@@ -51,7 +51,8 @@
       "fail-fast": false
       "matrix":
         "sanitize":
-          - "ON"
+          - "address"
+          - "thread"
         "lwipopts":
           - "pico_http_lwipopts_fallback"
         "ssid":
@@ -65,7 +66,7 @@
       "HOUSE_MATRIX_PASSWORD": "${{ matrix.password }}"
     "container":
       "image": "ghcr.io/jamesfxley/pico-tooling@sha256:2be78b00b122fe64c18bd2a4900c6be7b8b51471b3dbe3b701024d4b6b83d0e9"
-      "options": "--user 0"
+      "options": "--security-opt seccomp=unconfined --user 0"
   "check_build":
     "runs-on": "ubuntu-26.04"
     "if": "${{ github.event_name != 'schedule' }}"
@@ -83,7 +84,8 @@
           - "Debug"
           - "Release"
         "sanitize":
-          - "ON"
+          - "address"
+          - "thread"
         "profile":
           - "default"
           - "p8-rp2350"
@@ -103,7 +105,7 @@
       "BUILD_TYPE": "${{ matrix.build_type }}"
     "container":
       "image": "ghcr.io/jamesfxley/pico-tooling@sha256:2be78b00b122fe64c18bd2a4900c6be7b8b51471b3dbe3b701024d4b6b83d0e9"
-      "options": "--user 0"
+      "options": "--security-opt seccomp=unconfined --user 0"
   "check_consumer":
     "runs-on": "ubuntu-26.04"
     "if": "${{ github.event_name != 'schedule' }}"
