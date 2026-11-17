@@ -53,10 +53,10 @@ pico_family_propagate_install(PICO_HTTP PICO_LOGGING)
 pico_family_propagate_install(PICO_HTTP PICO_UTIL)
 pico_family_dependency(pico_logging
     REPOSITORY https://github.com/jamesfxley/pico-logging.git
-    REVISION fe23964417288a0dedfa27ddbd7e2f85b0915bae)
+    REVISION 724f4555863d60fb68b1ddff944c0ce89398c16a)
 pico_family_dependency(pico_util
     REPOSITORY https://github.com/jamesfxley/pico-util.git
-    REVISION 2afe3150a52429cb61c2330041cb4ec2e26c00ef)
+    REVISION 870e68b33012c9052d3336be4ad9abd58d44d4d1)
 pico_family_make_available(pico_logging pico_util)
 
 set(PICO_LWIPOPTS_TARGET "" CACHE STRING "Target carrying the application's lwipopts.h")

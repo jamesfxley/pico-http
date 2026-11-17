@@ -27,9 +27,10 @@ BUILD_ARGS='-DPICO_LWIPOPTS_TARGET=pico_http_lwipopts_fallback
 
 The matrix maps `HOUSE_MATRIX_PROFILE` to `PICO_HTTP_PROFILE`. Both named
 profiles have host tests and footprint budgets in `pico.toml`.
-`HOUSE_MATRIX_SANITIZE=ON` enables the sanitiser tree. Fuzz targets run bounded
-inputs through CTest. [Device benchmarks](../examples/bench/README.md) provide
-separate hardware evidence.
+`HOUSE_MATRIX_SANITIZE=address` or `thread` enables the sanitiser tree. Fuzz
+targets run bounded inputs through CTest.
+[Device benchmarks](../examples/bench/README.md) provide separate hardware
+evidence.
 
 ## Layout
 

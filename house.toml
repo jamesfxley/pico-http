@@ -57,14 +57,17 @@ lwipopts = "PICO_LWIPOPTS_TARGET"
 ssid = "PICO_HTTP_WIFI_SSID"
 password = "PICO_HTTP_WIFI_PASSWORD"
 
+# ThreadSanitizer cannot run under Docker's default seccomp filter (infra AR-2).
 [[ci.require]]
 group = "build"
-matrix = { build_type = ["Debug", "Release"], sanitize = ["ON"], profile = ["default", "p8-rp2350"], lwipopts = ["pico_http_lwipopts_fallback"], ssid = ["placeholder-ssid"], password = ["placeholder-password"] }
+matrix = { build_type = ["Debug", "Release"], sanitize = ["address", "thread"], profile = ["default", "p8-rp2350"], lwipopts = ["pico_http_lwipopts_fallback"], ssid = ["placeholder-ssid"], password = ["placeholder-password"] }
+container_options = "--security-opt seccomp=unconfined"
 
 [[ci.require]]
 group = "lint"
-matrix = { sanitize = ["ON"], lwipopts = ["pico_http_lwipopts_fallback"], ssid = ["placeholder-ssid"], password = ["placeholder-password"] }
+matrix = { sanitize = ["address", "thread"], lwipopts = ["pico_http_lwipopts_fallback"], ssid = ["placeholder-ssid"], password = ["placeholder-password"] }
 prepare = ["python3 dev.py build"]
+container_options = "--security-opt seccomp=unconfined"
 
 [[ci.require]]
 group = "firmware"
