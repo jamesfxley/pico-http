@@ -335,7 +335,7 @@ agree on and so cannot be set per-consumer.
 | BR-7 | Header storage overflow (`HTTPHeaders::set` failure) | — | `431` — **never a silent drop or truncation** | — |
 | BR-8 | Malformed syntax (method/version charset, request-line spacing, header framing, control chars in a field value) | — | `400` | — |
 | BR-9 | `Transfer-Encoding` other than a lone `chunked` | — | `501`. A lone `chunked` is decoded per §9; never misparsed as a zero-length body. | — |
-| BR-10 | Missing or duplicated `Host` header on an HTTP/1.1 request (RFC 9112 §3.2) | — | `400` | — |
+| BR-10 | More than one `Host` field line on any request, or none on an HTTP/1.1 request (RFC 9112 §3.2) | — | `400` | — |
 | BR-11 | Well-formed but unsupported HTTP version (`HTTP/<DIGIT>.<DIGIT>` that is not 1.0/1.1, e.g. `HTTP/2.0`) | — | `505` (RFC 9110 §15.6.6); a token that is not HTTP-version syntax is `400` (BR-8) | — |
 | BR-12 | Max concurrent deferred requests (AR-9) | 4 | `503` | `Profile::MAX_PENDING_RESPONSES` |
 | BR-13 | Max serialised response head (status line and header section a handler builds) | 1,024 B | `500` with `Content-Length: 0` and `Connection: close`, the handler's head and body dropped; never truncated, never a silent close | `Profile::HEAD_CAPACITY` |
@@ -382,7 +382,7 @@ what makes the handler's eventual `respond()` inert (AR-4).
 | NR-4 | `Transfer-Encoding` handling per BR-9: chunk-size hex parse with overflow bounds, trailers consumed and discarded, chunk extensions ignored (control octets in either → `400`). `Transfer-Encoding` on an HTTP/1.0 request is faulty framing → `400` (RFC 9112 §6.1). |
 | NR-5 | `Expect: 100-continue`: send `100 Continue` when the declared body is within limits; otherwise respond `413` without reading the body. On HTTP/1.0 the 100-continue expectation is ignored and no 1xx is sent (RFC 9110 §10.1.1, §15.2). Any other expectation → `417` (RFC 9110 §10.1.1) — never silently ignored. |
 | NR-6 | Response framing: every response carries an explicit `Content-Length`, or `Transfer-Encoding: chunked` for generator bodies of unknown length; HTTP/1.0 clients get length-delimited or close-delimited framing, never chunked. |
-| NR-7 | `Host` enforcement (RFC 9112 §3.2): an HTTP/1.1 request must carry exactly one `Host` header; missing or duplicated `Host` → `400` (BR-10). HTTP/1.0 imposes no such requirement. |
+| NR-7 | `Host` enforcement (RFC 9112 §3.2): a request with more than one `Host` field line → `400`, whatever its version; an HTTP/1.1 request without `Host` → `400` (BR-10). An HTTP/1.0 request may omit `Host`. |
 | NR-8 | Method dispatch: a request whose URI matches a registered route only under other methods → `405` with an `Allow` header listing those methods (RFC 9110 §15.5.6, §10.2.1); a URI with no registered route → `404`. |
 | NR-9 | `HEAD` is supported wherever `GET` is (RFC 9110 §9.1): an explicit `HEAD` route wins; otherwise the `GET` handler runs and the response carries its header section — including `Content-Length` / `Transfer-Encoding` — with no body and, for chunked framing, no last-chunk (RFC 9110 §9.3.2). Body suppression applies to every response to a `HEAD` request. |
 | NR-10 | Repeated header field names combine into one comma-separated value in received order (RFC 9110 §5.2); a combined value that overflows storage → `431` (BR-7), never a silent replacement or drop. |
@@ -480,7 +480,7 @@ them; review checks these citations (EN-02.1).
 | NR-4 | `pico_http_http_tests`: `DecodesChunkedAcrossEverySplit`, `TransferEncodingOnHttp10IsBadRequest`, `RejectsControlBytesInExtensionsAndTrailers` | Chunked decoding agrees at every split; invalid framing and controls fail. |
 | NR-5 | `pico_http_http_tests`: `Http10IgnoresContinueExpectation`, `Expect100ContinueEmittedBeforeBody`, `UnknownExpectationReturns417` | HTTP/1.0 ignores 100-continue and delivers the body; 1.1 sends 100 before body; other expectations give 417. |
 | NR-6 | `pico_http_http_tests`: `RoutesGetRequestToHandler`, `ChunkedGeneratorResponseRoundTrips`, `ChunkedDowngradesToCloseDelimitedForHttp10` | 1.1 chunked output decodes exactly; HTTP/1.0 closes to delimit unknown length. |
-| NR-7 | `pico_http_http_tests`: `Http11RequiresExactlyOneHost` | HTTP/1.1 missing or duplicate Host fails; HTTP/1.0 needs no Host. |
+| NR-7 | `pico_http_http_tests`: `Http11RequiresExactlyOneHost`, `Http10RejectsMoreThanOneHost` | HTTP/1.1 missing or duplicate Host fails; HTTP/1.0 duplicate Host fails; HTTP/1.0 needs no Host. |
 | NR-8 | `pico_http_http_tests`: `KnownUriWrongMethodReturns405WithAllow`, `UnknownRouteReturns404` | Known URI with wrong method gives 405 with Allow; unknown URI gives 404. |
 | NR-9 | `pico_http_http_tests`: `HeadIsServedFromGetRouteWithoutBody`, `ExplicitHeadRouteWinsOverGetFallback`, `HeadOnChunkedRouteEmitsHeadersOnlyNoLastChunk` | HEAD suppresses every body and last-chunk; explicit HEAD wins. |
 | NR-10 | `pico_http_http_tests`: `RepeatedHeaderFieldsCombineAsList`, `AddFailsWholeWhenCombinedValueOverflows`, `RepeatedHeaderValueOverflowIs431` | Repeated names combine in arrival order; overflow leaves stored headers unchanged and the parser returns `431`. |
