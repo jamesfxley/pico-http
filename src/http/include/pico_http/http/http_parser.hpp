@@ -753,9 +753,10 @@ class HttpParser {
             expect_continue_ = false;
         }
         head_complete_ = true;  // request line + headers fully parsed
-        // An HTTP/1.1 request MUST carry exactly one Host header. HTTP/1.0
-        // has no such rule (RFC 9112 §3.2).
-        if (version_.view() == "HTTP/1.1" && host_count_ != 1U) {
+        // No request may carry more than one Host field line, and an HTTP/1.1
+        // request must carry one (RFC 9112 §3.2).
+        if (host_count_ > 1U ||
+            (version_.view() == "HTTP/1.1" && host_count_ == 0U)) {
             fail(ParseResult::BAD_REQUEST);
             return;
         }
