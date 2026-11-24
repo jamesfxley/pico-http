@@ -1803,9 +1803,11 @@ def t19_deferred_handler(cfg):
     dispatched = stats.get("pending_dispatches", 0)
     exhausted = stats.get("deferrals_refused", 0)
     handler_timeouts = stats.get("disconnect_timeout_handler", 0)
-    # pending_responses counts parked deferrals; one is tolerated (BR-12).
+    # pending_responses counts parked deferrals. The /stats handler does not
+    # defer, and the load requests have ended before /stats is read, so any
+    # deferral still parked is stranded (AR-9).
     held = stats.get("pending_responses", 0)
-    stranded = max(0, held - 1)
+    stranded = held
 
     ok = bool(
         dispatched >= def_heavy > 0 and
