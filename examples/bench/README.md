@@ -82,7 +82,7 @@ t14 (timeout precision: slow), t17 (body-mode comparison), t18
 | t16 | Bit-exact chunked `/stream/<n>` output without Content-Length, preserving keep-alive. |
 | t17 | Opt-in buffered/static comparison through `/bench/buffered/<n>` and `/bench/static/<n>`. Default size is 2048 for both profiles. Use `--sizes 8192` with `p8-rp2350` for 8 KiB. Buffered bodies above the cap are skipped with 413. |
 | t18 | Opt-in copied-body allocation checks. Static/generator requests leave approximately zero growth. Copies across all slots, repeated and at smaller sizes, leave approximately zero growth after slots become idle. |
-| t19 | Checks deferred work, dispatch coverage, heavy-work errors, handler timeouts and stranded pool entries. Latency, improvement and offered-load ratio are review evidence. |
+| t19 | Checks deferred work, dispatch coverage, heavy-work errors, handler timeouts and stranded deferrals. Latency, improvement and offered-load ratio are review evidence. |
 | t20 | Parallel downloads; records wall-clock and `stall_free_kbps` throughput, worst receive gap and the `2 × tcp_rto_ms` plus delivery expectation. Completion and lwIP allocation checks decide the verdict. |
 | t21 | One thousand reset, malformed-line, overlong-header and slowloris events. A fresh `/ping` completes within 1 s while two slowloris slots remain, then timeout reclaims them. Checks slots, heap and counters. |
 | t22 | Backpressured downloads across all slots with 8 KiB pipelined input behind each. Checks complete bit-exact output, throttling, zero overflow and no failed lwIP allocations. Records the pbuf high-water mark. |
