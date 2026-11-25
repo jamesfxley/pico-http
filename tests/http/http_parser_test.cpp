@@ -712,6 +712,16 @@ TEST(HttpParserConformanceTest, Http11RequiresExactlyOneHost) {
               ParseResult::COMPLETE);
 }
 
+TEST(HttpParserConformanceTest, Http10RejectsMoreThanOneHost) {
+    // The rule against more than one Host field line covers every request,
+    // not only HTTP/1.1 (RFC 9112 §3.2).
+    EXPECT_EQ(verdict<DefaultHttpLimits>("GET / HTTP/1.0\r\nHost: a\r\n\r\n"),
+              ParseResult::COMPLETE);
+    EXPECT_EQ(verdict<DefaultHttpLimits>(
+                  "GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n"),
+              ParseResult::BAD_REQUEST);
+}
+
 TEST(HttpParserConformanceTest, RejectsControlCharsInFieldValue) {
     // A field value may contain VCHAR, SP and HTAB, but no other controls or
     // DEL (RFC 9110 §5.5).

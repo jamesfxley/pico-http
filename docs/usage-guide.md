@@ -198,8 +198,8 @@ over a limit get the correct status (`414`/`431`/`413`), malformed requests
 Chunked request bodies are decoded transparently; the handler sees the
 assembled body either way.
 
-Protocol conformance is enforced before dispatch (NR-1..NR-10): an HTTP/1.1
-request must carry exactly one `Host` header (missing or duplicated → `400`);
+Protocol conformance is enforced before dispatch (NR-1..NR-10): a request
+with more than one `Host` header, or an HTTP/1.1 request without one, → `400`;
 a well-formed but unsupported HTTP version (e.g. `HTTP/2.0`) → `505`; a control
 character in a field value → `400`; an `Expect` other than `100-continue` →
 `417`; `Transfer-Encoding` on an HTTP/1.0 request → `400`. Repeated header
